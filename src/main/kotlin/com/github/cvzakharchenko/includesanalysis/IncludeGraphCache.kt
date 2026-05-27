@@ -19,6 +19,8 @@ import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 
+private const val UNBOUNDED_SCOPE_DESCENDANT_COUNT_LIMIT = 2000
+
 internal val PSI_FILE_COMPARATOR = compareBy<PsiFile>(
     { it.name.lowercase() },
     { it.virtualFile?.path?.lowercase() ?: "" },
@@ -103,6 +105,19 @@ class IncludeGraphCache(private val project: com.intellij.openapi.project.Projec
         showOutOfScopeLeaves: Boolean,
         ancestorPaths: Set<String> = emptySet(),
     ): String {
+        if (isUnboundedIncludeScope(scope)) {
+            val count = limitedVisibleDescendantCount(
+                file,
+                direction,
+                scope,
+                filter,
+                showOutOfScopeLeaves,
+                ancestorPaths,
+                UNBOUNDED_SCOPE_DESCENDANT_COUNT_LIMIT,
+            )
+            return childCountText(count.filteredCount, count.totalCount, filter, count.truncated)
+        }
+
         val reachablePaths = scopeBoundedReachablePaths(file, direction, scope, showOutOfScopeLeaves, ancestorPaths)
         val totalCount = reachablePaths.size
         val filteredCount = if (filter.isEmpty) {
@@ -111,6 +126,75 @@ class IncludeGraphCache(private val project: com.intellij.openapi.project.Projec
             reachablePaths.count { path -> matchesFilter(path, filter) }
         }
         return childCountText(filteredCount, totalCount, filter)
+    }
+
+    private fun limitedVisibleDescendantCount(
+        file: PsiFile,
+        direction: IncludeDirection,
+        scope: SearchScope,
+        filter: IncludeHierarchyFilter,
+        showOutOfScopeLeaves: Boolean,
+        ancestorPaths: Set<String>,
+        limit: Int,
+    ): DescendantCount {
+        val rootPath = file.virtualFile?.path ?: return DescendantCount.EMPTY
+        val blockedPaths = HashSet<String>(ancestorPaths.size + 1)
+        blockedPaths.addAll(ancestorPaths)
+        blockedPaths.add(rootPath)
+
+        val queuedPaths = HashSet<String>(blockedPaths)
+        val countedPaths = linkedSetOf<String>()
+        val queue = ArrayDeque<PsiFile>()
+        var filteredCount = 0
+        var truncated = false
+
+        fun countPath(path: String): Boolean {
+            if (path in blockedPaths || !countedPaths.add(path)) {
+                return true
+            }
+
+            if (!filter.isEmpty && matchesFilter(path, filter)) {
+                filteredCount++
+            }
+
+            if (countedPaths.size >= limit) {
+                truncated = true
+                return false
+            }
+
+            return true
+        }
+
+        queue.add(file)
+        while (queue.isNotEmpty() && !truncated) {
+            ProgressManager.checkCanceled()
+            val currentFile = queue.removeFirst()
+            for (childFile in directRelated(currentFile, direction)) {
+                val virtualFile = childFile.virtualFile ?: continue
+                val childPath = virtualFile.path
+                val inScope = contains(scope, childPath, virtualFile)
+                if (!inScope) {
+                    if (showOutOfScopeLeaves && !countPath(childPath)) {
+                        break
+                    }
+                    continue
+                }
+
+                if (!countPath(childPath)) {
+                    break
+                }
+
+                if (childPath !in blockedPaths && queuedPaths.add(childPath)) {
+                    queue.addLast(childFile)
+                }
+            }
+        }
+
+        return DescendantCount(
+            filteredCount = if (filter.isEmpty) countedPaths.size else filteredCount,
+            totalCount = countedPaths.size,
+            truncated = truncated,
+        )
     }
 
     fun flatFiles(
@@ -536,6 +620,16 @@ class IncludeGraphCache(private val project: com.intellij.openapi.project.Projec
         val path: String,
         val includePath: Boolean,
     )
+
+    private data class DescendantCount(
+        val filteredCount: Int,
+        val totalCount: Int,
+        val truncated: Boolean,
+    ) {
+        companion object {
+            val EMPTY = DescendantCount(0, 0, false)
+        }
+    }
 
     private data class ReachablePathsEntry(
         val paths: Set<String>,

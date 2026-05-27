@@ -77,8 +77,15 @@ class IncludeHierarchyFilter private constructor(
     }
 }
 
-internal fun childCountText(filteredCount: Int, totalCount: Int, filter: IncludeHierarchyFilter): String =
-    if (filter.isEmpty) totalCount.toString() else "$filteredCount / $totalCount"
+internal fun childCountText(
+    filteredCount: Int,
+    totalCount: Int,
+    filter: IncludeHierarchyFilter,
+    truncated: Boolean = false,
+): String {
+    val totalText = if (truncated) "$totalCount+" else totalCount.toString()
+    return if (filter.isEmpty) totalText else "$filteredCount / $totalText"
+}
 
 internal fun displayPath(file: PsiFile): String {
     val virtualFile = file.virtualFile ?: return file.name

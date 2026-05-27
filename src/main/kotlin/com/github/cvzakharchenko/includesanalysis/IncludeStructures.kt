@@ -46,6 +46,7 @@ class IncludeTreeStructure(
         val scope = state.scope
         val filter = state.filter
         val showOutOfScopeLeaves = state.showDirectOutOfScopeLeaves
+        val showEagerChildCounts = state.showChildrenCount && !isUnboundedIncludeScope(scope)
 
         if (descriptor.pruneChildren || !canExpand(descriptor, scope, cache)) {
             descriptor.updateChildCount(if (state.showChildrenCount) childCountText(0, 0, filter) else null)
@@ -66,7 +67,7 @@ class IncludeTreeStructure(
                     showFullPath = state.showFullPath,
                 )
                 childDescriptor.updateChildCount(
-                    if (state.showChildrenCount) {
+                    if (showEagerChildCounts) {
                         visibleDescendantCountText(childDescriptor, scope, filter, showOutOfScopeLeaves)
                     } else {
                         null
@@ -127,6 +128,7 @@ class FlatIncludeStructure(
         val scope = state.scope
         val filter = state.filter
         val showOutOfScopeLeaves = state.showDirectOutOfScopeLeaves
+        val showRowCounts = state.showChildrenCount && !isUnboundedIncludeScope(scope)
         val files = autoloadFilesProvider()
             ?.filter { childFile -> cache.matchesFilter(childFile, filter) }
             ?: cache.flatFiles(includeDescriptor.file, direction, scope, filter, showOutOfScopeLeaves)
@@ -154,7 +156,7 @@ class FlatIncludeStructure(
         return files.asSequence()
             .sortedWith(PSI_FILE_COMPARATOR)
             .map { childFile ->
-                val childCount = if (state.showChildrenCount) {
+                val childCount = if (showRowCounts) {
                     cache.visibleDescendantCountText(childFile, direction, scope, filter, showOutOfScopeLeaves)
                 } else {
                     null
