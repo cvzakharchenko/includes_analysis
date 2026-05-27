@@ -26,18 +26,23 @@ import com.intellij.ui.PopupHandler
 import com.intellij.ui.SearchTextField
 import com.jetbrains.rider.cpp.fileType.psi.CppFile
 import com.jetbrains.rider.model.CppIncludeGraph
+import java.awt.BorderLayout
+import java.awt.Component
+import java.awt.Container
+import java.awt.Dimension
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Supplier
 import javax.swing.JLabel
-import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.JPanel
 import javax.swing.JTree
 import javax.swing.SwingUtilities
 import javax.swing.Timer
+import javax.swing.border.EmptyBorder
 import javax.swing.event.DocumentEvent
+import javax.swing.tree.DefaultMutableTreeNode
 
 class ScopedIncludeHierarchyBrowser(
     private val projectRef: Project,
@@ -54,6 +59,7 @@ class ScopedIncludeHierarchyBrowser(
     private var hideRepeatedIncludes = properties.getBoolean(HIDE_REPEATED_INCLUDES_PROPERTY, false)
     private var filterByFilePath = properties.getBoolean(FILTER_BY_FILE_PATH_PROPERTY, false)
     private var showFullFilePath = properties.getBoolean(SHOW_FULL_FILE_PATH_PROPERTY, false)
+    private var showChildCounts = properties.getBoolean(SHOW_CHILD_COUNTS_PROPERTY, false)
     private var autoloadHierarchy = properties.getBoolean(AUTOLOAD_HIERARCHY_PROPERTY, false)
     private var filter = IncludeHierarchyFilter.empty(filterByFilePath)
     private val autoloadProgressLock = Any()
@@ -63,9 +69,6 @@ class ScopedIncludeHierarchyBrowser(
     private var autoloadGeneration = 0
     private var autoloadProgress = AutoloadProgress(0, 0)
     private val autoloadFilesByPath = LinkedHashMap<String, CppFile>()
-    private val autoloadProgressLabel = JLabel("0/0").apply {
-        isVisible = autoloadHierarchy
-    }
     private val filterRefreshTimer = Timer(FILTER_REFRESH_DELAY_MS) {
         refreshFilterResults()
     }.apply {
@@ -104,7 +107,9 @@ class ScopedIncludeHierarchyBrowser(
                 cache,
                 { selectedScope },
                 { filter },
+                { showOutOfScopeLeaves },
                 { showFullFilePath },
+                { showChildCounts },
                 { autoloadFilesSnapshot() },
             )
         } else {
@@ -117,11 +122,23 @@ class ScopedIncludeHierarchyBrowser(
                 { showOutOfScopeLeaves },
                 { hideRepeatedIncludes },
                 { showFullFilePath },
+                { showChildCounts },
             )
         }
     }
 
-    override fun createLegendPanel(): JPanel? = null
+    override fun createLegendPanel(): JPanel =
+        JPanel(BorderLayout()).apply {
+            border = EmptyBorder(2, 6, 2, 6)
+            isVisible = false
+            add(
+                JLabel("Autoload: 0/0").apply {
+                    name = AUTOLOAD_PROGRESS_LABEL_NAME
+                    isVisible = false
+                },
+                BorderLayout.WEST,
+            )
+        }
 
     override fun doRefresh(currentBuilderOnly: Boolean) {
         cancelAutoload()
@@ -212,7 +229,6 @@ class ScopedIncludeHierarchyBrowser(
         actionGroup.add(DirectionModeAction())
         actionGroup.add(FlatModeAction())
         actionGroup.add(OptionsGroup())
-        actionGroup.add(DefaultCustomComponentAction { autoloadProgressLabel })
         actionGroup.add(DefaultCustomComponentAction { filterField })
         actionGroup.add(DefaultCustomComponentAction { createScopeChooser() })
         super.prependActions(actionGroup)
@@ -221,6 +237,7 @@ class ScopedIncludeHierarchyBrowser(
     private fun createScopeChooser(): ScopeChooserCombo {
         val chooser = ScopeChooserCombo()
         chooser.init(projectRef, true, true, selectedScope, null)
+        shrinkScopeChooser(chooser)
         chooser.addActionListener {
             val scope = chooser.selectedScope ?: GlobalSearchScope.projectScope(projectRef)
             if (scope != selectedScope) {
@@ -231,6 +248,14 @@ class ScopedIncludeHierarchyBrowser(
         }
         Disposer.register(this, chooser)
         return chooser
+    }
+
+    private fun shrinkScopeChooser(chooser: ScopeChooserCombo) {
+        val height = chooser.preferredSize.height
+        val size = Dimension(SCOPE_CHOOSER_WIDTH, height)
+        chooser.preferredSize = size
+        chooser.minimumSize = size
+        chooser.maximumSize = size
     }
 
     private fun createFilterField(): SearchTextField {
@@ -421,8 +446,30 @@ class ScopedIncludeHierarchyBrowser(
         val progress = synchronized(autoloadProgressLock) {
             autoloadProgress
         }
-        autoloadProgressLabel.text = "${progress.processed}/${progress.discovered}"
-        autoloadProgressLabel.isVisible = autoloadHierarchy
+        val label = findAutoloadProgressLabel(this) ?: return
+        label.text = "Autoload: ${progress.processed}/${progress.discovered}"
+        label.isVisible = autoloadHierarchy
+        label.parent?.isVisible = autoloadHierarchy
+        label.parent?.revalidate()
+        label.parent?.repaint()
+    }
+
+    private fun findAutoloadProgressLabel(component: Component): JLabel? {
+        if (component is JLabel && component.name == AUTOLOAD_PROGRESS_LABEL_NAME) {
+            return component
+        }
+
+        if (component !is Container) {
+            return null
+        }
+
+        for (child in component.components) {
+            val label = findAutoloadProgressLabel(child)
+            if (label != null) {
+                return label
+            }
+        }
+        return null
     }
 
     private fun refreshAutoloadResults() {
@@ -513,6 +560,7 @@ class ScopedIncludeHierarchyBrowser(
             add(HideRepeatedIncludesAction())
             add(FilterByFilePathAction())
             add(ShowFullFilePathAction())
+            add(ShowChildCountsAction())
         }
     }
 
@@ -561,6 +609,18 @@ class ScopedIncludeHierarchyBrowser(
             if (showFullFilePath != state) {
                 showFullFilePath = state
                 properties.setValue(SHOW_FULL_FILE_PATH_PROPERTY, showFullFilePath, false)
+                rebuildWithoutClearingCaches(false)
+            }
+        }
+    }
+
+    private inner class ShowChildCountsAction : DumbAwareToggleAction("Show Child Counts") {
+        override fun isSelected(event: AnActionEvent): Boolean = showChildCounts
+
+        override fun setSelected(event: AnActionEvent, state: Boolean) {
+            if (showChildCounts != state) {
+                showChildCounts = state
+                properties.setValue(SHOW_CHILD_COUNTS_PROPERTY, showChildCounts, false)
                 rebuildWithoutClearingCaches(false)
             }
         }
@@ -615,7 +675,10 @@ class ScopedIncludeHierarchyBrowser(
         private const val HIDE_REPEATED_INCLUDES_PROPERTY = PROPERTY_PREFIX + "hide.repeated.includes"
         private const val FILTER_BY_FILE_PATH_PROPERTY = PROPERTY_PREFIX + "filter.by.file.path"
         private const val SHOW_FULL_FILE_PATH_PROPERTY = PROPERTY_PREFIX + "show.full.file.path"
+        private const val SHOW_CHILD_COUNTS_PROPERTY = PROPERTY_PREFIX + "show.child.counts"
         private const val AUTOLOAD_HIERARCHY_PROPERTY = PROPERTY_PREFIX + "autoload.hierarchy"
+        private const val AUTOLOAD_PROGRESS_LABEL_NAME = PROPERTY_PREFIX + "autoload.progress.label"
         private const val AUTOLOAD_REFRESH_DELAY_MS = 500
+        private const val SCOPE_CHOOSER_WIDTH = 160
     }
 }
