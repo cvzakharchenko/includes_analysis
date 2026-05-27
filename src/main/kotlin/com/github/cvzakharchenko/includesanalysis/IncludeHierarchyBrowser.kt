@@ -7,11 +7,11 @@ import com.intellij.ide.hierarchy.HierarchyTreeStructure
 import com.intellij.ide.util.scopeChooser.ScopeChooserCombo
 import com.intellij.ide.util.treeView.AlphaComparator
 import com.intellij.ide.util.treeView.NodeDescriptor
+import com.intellij.openapi.actionSystem.ActionGroup
 import com.intellij.openapi.actionSystem.ActionPlaces
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.actionSystem.DataKey
 import com.intellij.openapi.actionSystem.ex.CustomComponentAction
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.actionSystem.Presentation
@@ -24,16 +24,18 @@ import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.ui.DocumentAdapter
+import com.intellij.ui.PopupHandler
 import com.intellij.ui.SearchTextField
 import com.intellij.util.Alarm
-import com.intellij.util.ui.JBUI
 import java.awt.Dimension
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import java.util.Comparator
 import javax.swing.JComponent
-import javax.swing.JLabel
 import javax.swing.JTree
 import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
+import javax.swing.tree.DefaultMutableTreeNode
 
 class IncludeHierarchyBrowser(
     project: Project,
@@ -48,6 +50,7 @@ class IncludeHierarchyBrowser(
         it.skipDuplicateSubtree = settings.skipDuplicateSubtree
         it.filterByPath = settings.filterByPath
         it.showFullPath = settings.showFullPath
+        it.showChildrenCount = settings.showChildrenCount
         it.autoload = settings.autoload
         // Seed with a safe scope before the toolbar paints. Without this, the first
         // buildChildren can race the ScopeChooserCombo render: state.scope is null,
@@ -60,16 +63,18 @@ class IncludeHierarchyBrowser(
     private var loaderRefreshPending = false
     private var filterField: SearchTextField? = null
     private var skipCacheClear = false
-    private var progressLabel: JLabel? = null
-    private var loaderProcessed = 0
-    private var loaderDiscovered = 0
-    private var loaderDone = true
-    private val autoloader = IncludeGraphAutoloader(cache) { processed, discovered, done ->
-        SwingUtilities.invokeLater { onLoaderProgress(processed, discovered, done) }
+    private val autoloader = IncludeGraphAutoloader(cache) { _, _, done ->
+        SwingUtilities.invokeLater { onLoaderProgress(done) }
     }
 
     init {
         Disposer.register(this) { autoloader.cancel() }
+        // The toolbar / view hasn't been constructed yet at this point; defer the
+        // initial autoload until after the framework has wired up the view so the
+        // loader-driven refreshAllViews has a tree root to update.
+        ApplicationManager.getApplication().invokeLater {
+            if (state.autoload) restartAutoload()
+        }
     }
 
     companion object {
@@ -77,22 +82,6 @@ class IncludeHierarchyBrowser(
         const val TYPE_INCLUDEES_FLAT: String = "What This File Includes (Flat)"
         const val TYPE_INCLUDERS_TREE: String = "What Includes This File"
         const val TYPE_INCLUDERS_FLAT: String = "What Includes This File (Flat)"
-
-        // Lets actions registered in HierarchyViewPopupMenu (in plugin.xml) detect when
-        // they're firing inside the Project Include Hierarchy and reach back to the
-        // browser. HierarchyBrowserBase.BROWSER_DATA_KEY exists but is @ApiStatus.Internal,
-        // and casting it covers every hierarchy view in the IDE — keeping our own key
-        // means our actions only show in our view.
-        val BROWSER_KEY: DataKey<IncludeHierarchyBrowser> = DataKey.create("IncludeHierarchyBrowser")
-    }
-
-    override fun getData(dataId: String): Any? {
-        if (BROWSER_KEY.`is`(dataId)) return this
-        return super.getData(dataId)
-    }
-
-    fun setFilter(text: String) {
-        filterField?.text = text
     }
 
     fun initialViewType(): String = typeNameFor(state)
@@ -103,10 +92,40 @@ class IncludeHierarchyBrowser(
         descriptor.psiElement
 
     override fun createTrees(trees: MutableMap<in String, in JTree>) {
-        trees[TYPE_INCLUDEES_TREE] = createTree(false)
-        trees[TYPE_INCLUDEES_FLAT] = createTree(false)
-        trees[TYPE_INCLUDERS_TREE] = createTree(false)
-        trees[TYPE_INCLUDERS_FLAT] = createTree(false)
+        val popupGroup = DefaultActionGroup().apply {
+            add(FilterByFileNameAction())
+        } as ActionGroup
+        trees[TYPE_INCLUDEES_TREE] = createIncludeTree(popupGroup)
+        trees[TYPE_INCLUDEES_FLAT] = createIncludeTree(popupGroup)
+        trees[TYPE_INCLUDERS_TREE] = createIncludeTree(popupGroup)
+        trees[TYPE_INCLUDERS_FLAT] = createIncludeTree(popupGroup)
+    }
+
+    // Right-click doesn't auto-select the row, so without this MouseAdapter the popup
+    // would fire against whatever was selected before, not the row the user clicked on.
+    // PopupHandler.installPopupMenu attaches the popup on top of the default tree menu,
+    // and our handler wins because it was installed last.
+    private fun createIncludeTree(popupGroup: ActionGroup): JTree {
+        val tree = createTree(true)
+        tree.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(event: MouseEvent) = selectPopupRow(event)
+            override fun mouseReleased(event: MouseEvent) = selectPopupRow(event)
+        })
+        PopupHandler.installPopupMenu(tree, popupGroup, "IncludeHierarchyViewPopup")
+        return tree
+    }
+
+    private fun selectPopupRow(event: MouseEvent) {
+        if (!event.isPopupTrigger && !SwingUtilities.isRightMouseButton(event)) return
+        val tree = event.source as? JTree ?: return
+        val path = tree.getPathForLocation(event.x, event.y) ?: return
+        tree.selectionPath = path
+    }
+
+    private fun selectedDescriptorFile(): PsiFile? {
+        val tree = runCatching { currentTree }.getOrNull() ?: return null
+        val node = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode ?: return null
+        return (node.userObject as? IncludeNodeDescriptor)?.psiElement as? PsiFile
     }
 
     override fun createHierarchyTreeStructure(typeName: String, psiElement: PsiElement): HierarchyTreeStructure? {
@@ -146,7 +165,6 @@ class IncludeHierarchyBrowser(
         actionGroup.add(OptionsDropdownGroup())
         actionGroup.add(Separator())
         actionGroup.add(FilterFieldAction())
-        actionGroup.add(LoadProgressAction())
         actionGroup.add(Separator())
         super.appendActions(actionGroup, helpID)
     }
@@ -207,6 +225,12 @@ class IncludeHierarchyBrowser(
             val preselect = settings.scopeName ?: "Project Files"
             val combo = ScopeChooserCombo(myProject, false, true, preselect)
             Disposer.register(this@IncludeHierarchyBrowser, combo)
+            // Default ScopeChooserCombo width is ~250px and dominates the toolbar;
+            // clamp to a much narrower footprint. Long scope names still tooltip-up
+            // and the dropdown itself sizes to its content when opened.
+            val h = combo.preferredSize.height
+            combo.preferredSize = Dimension(120, h)
+            combo.maximumSize = Dimension(120, h)
             val resolved = combo.selectedScope
             if (resolved != null) {
                 state.scope = resolved
@@ -295,6 +319,7 @@ class IncludeHierarchyBrowser(
             add(SkipDuplicateSubtreeToggleAction())
             add(FilterByPathToggleAction())
             add(ShowFullPathToggleAction())
+            add(ShowChildrenCountToggleAction())
             add(AutoloadToggleAction())
         }
 
@@ -359,6 +384,20 @@ class IncludeHierarchyBrowser(
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
+    private inner class ShowChildrenCountToggleAction : ToggleAction(
+        "Show Descendant Count",
+        "Display the cumulative number of reachable descendants in parentheses after each file name",
+        null,
+    ) {
+        override fun isSelected(e: AnActionEvent): Boolean = state.showChildrenCount
+        override fun setSelected(e: AnActionEvent, value: Boolean) {
+            state.showChildrenCount = value
+            settings.showChildrenCount = value
+            refreshAllViews()
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
     private inner class AutoloadToggleAction : ToggleAction(
         "Autoload Full Hierarchy",
         "Walk the include graph in the background and populate the whole hierarchy without waiting for expansions",
@@ -373,25 +412,19 @@ class IncludeHierarchyBrowser(
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
-    private inner class LoadProgressAction : AnAction(), CustomComponentAction {
-        override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
-            val label = JLabel("").apply {
-                border = JBUI.Borders.empty(0, 8)
-                toolTipText = "Files processed / files discovered"
-            }
-            progressLabel = label
-            updateProgressLabel()
-            // Trigger the initial run now that the toolbar has materialized; before
-            // this point there's no place to display progress, and the tree builder
-            // hasn't necessarily attached its model.
-            if (state.autoload) restartAutoload()
-            return label
+    // Right-click → "Filter by File Name" on a tree row replaces the filter text with
+    // that file's name. The popup is installed by createIncludeTree, and the selected
+    // row is resolved at action time so we don't need a custom DataProvider.
+    private inner class FilterByFileNameAction : AnAction("Filter by File Name") {
+        override fun actionPerformed(e: AnActionEvent) {
+            val file = selectedDescriptorFile() ?: return
+            filterField?.text = file.name
         }
 
-        override fun actionPerformed(e: AnActionEvent) = Unit
         override fun update(e: AnActionEvent) {
-            e.presentation.isEnabledAndVisible = true
+            e.presentation.isEnabledAndVisible = selectedDescriptorFile() != null
         }
+
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
@@ -400,24 +433,11 @@ class IncludeHierarchyBrowser(
         loaderRefreshAlarm.cancelAllRequests()
         loaderRefreshPending = false
         if (state.autoload) {
-            loaderProcessed = 0
-            loaderDiscovered = 0
-            loaderDone = false
-            updateProgressLabel()
             autoloader.start(baseFile, state.direction, state)
-        } else {
-            loaderProcessed = 0
-            loaderDiscovered = 0
-            loaderDone = true
-            updateProgressLabel()
         }
     }
 
-    private fun onLoaderProgress(processed: Int, discovered: Int, done: Boolean) {
-        loaderProcessed = processed
-        loaderDiscovered = discovered
-        loaderDone = done
-        updateProgressLabel()
+    private fun onLoaderProgress(done: Boolean) {
         if (done) {
             // One final refresh so the last batch lands; cancel any pending throttled
             // refresh since we're about to do one synchronously anyway.
@@ -432,17 +452,6 @@ class IncludeHierarchyBrowser(
                 loaderRefreshPending = false
                 refreshAllViews()
             }, 500)
-        }
-    }
-
-    private fun updateProgressLabel() {
-        val label = progressLabel ?: return
-        if (!state.autoload) {
-            label.isVisible = false
-            label.text = ""
-        } else {
-            label.isVisible = true
-            label.text = "$loaderProcessed / $loaderDiscovered"
         }
     }
 }

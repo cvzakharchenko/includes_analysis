@@ -12,7 +12,7 @@ class IncludeTreeStructure(
     private val state: IncludeFilterState,
     private val direction: IncludeDirection,
     private val cache: IncludeGraphCache,
-) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state)) {
+) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state, cache, direction)) {
 
     // Per-structure memos. A new IncludeTreeStructure is created on every doRefresh,
     // so these are pinned to one (scope, query, option) configuration and live for
@@ -38,7 +38,7 @@ class IncludeTreeStructure(
         }
 
         return visibleChildren(file)
-            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state) }
+            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state, cache, direction) }
             .toTypedArray()
     }
 
@@ -77,7 +77,7 @@ class FlatIncludeStructure(
     private val state: IncludeFilterState,
     private val direction: IncludeDirection,
     private val cache: IncludeGraphCache,
-) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state)) {
+) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state, cache, direction)) {
 
     override fun buildChildren(descriptor: HierarchyNodeDescriptor): Array<Any> {
         if (descriptor.parentDescriptor != null) return emptyArray()
@@ -87,7 +87,7 @@ class FlatIncludeStructure(
             .asSequence()
             .filter { state.matchesQuery(it) }
             .sortedBy { it.name.lowercase() }
-            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state) }
+            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state, cache, direction) }
             .toList()
             .toTypedArray()
     }
