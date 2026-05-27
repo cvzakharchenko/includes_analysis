@@ -6,6 +6,7 @@
         <p>Adds a <b>Project Include Hierarchy</b> view for C/C++/Objective-C files in CLion.</p>
         <ul>
             <li><b>Scope dropdown</b> - reuse IDE scopes, including custom scopes from Settings, so expansion can stay inside the project areas you care about.</li>
+            <li><b>All Files (Including Excluded)</b> - select this synthetic scope to bypass IDE scope checks.</li>
             <li><b>Flat list toggle</b> - collapse the tree into a deduplicated alphabetical list of unique includes.</li>
             <li><b>Filter field</b> - type to keep matching nodes, with matching descendants preserving their parent context.</li>
         </ul>
@@ -14,6 +15,10 @@
 
     <depends>com.intellij.modules.clion</depends>
     <depends>org.jetbrains.plugins.clion.radler</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <scopeDescriptorProvider implementation="com.github.cvzakharchenko.includesanalysis.AllFilesIncludingExcludedScopeDescriptorProvider"/>
+    </extensions>
 
     <actions>
         <action id="ProjectIncludeHierarchy.Browse"

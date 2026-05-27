@@ -15,6 +15,7 @@ Open any C/C++/Objective-C file and choose **Navigate | Project Include Hierarch
 or use the default shortcut `Ctrl+Alt+Shift+I`.
 
 - **Scope dropdown**: reuse built-in or custom IntelliJ scopes.
+  Use **All Files (Including Excluded)** to bypass IDE scope checks entirely.
 - **Show Includers toggle**: switch between files included by the current file and files
   that include the current file.
 - **Flat List toggle**: show a deduplicated alphabetical list for either direction.
