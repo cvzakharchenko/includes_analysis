@@ -17,6 +17,9 @@ class IncludeHierarchySettings : PersistentStateComponent<IncludeHierarchySettin
     var flat: Boolean = false
     var showFirstOutOfScopeLeaf: Boolean = false
     var skipDuplicateSubtree: Boolean = false
+    var filterByPath: Boolean = false
+    var showFullPath: Boolean = false
+    var autoload: Boolean = false
     var scopeName: String? = null
 
     override fun getState(): IncludeHierarchySettings = this

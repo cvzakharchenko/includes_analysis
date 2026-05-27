@@ -3,11 +3,11 @@ package com.github.cvzakharchenko.includesanalysis
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.progress.ProcessCanceledException
+import com.intellij.openapi.progress.runBlockingCancellable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
-import com.jetbrains.rd.framework.impl.RpcTimeouts
 import com.jetbrains.rider.model.cppIncludeGraph
 import com.jetbrains.rider.projectView.hasSolution
 import com.jetbrains.rider.projectView.solution
@@ -38,7 +38,7 @@ class IncludeGraphCache(private val project: Project) {
                 IncludeDirection.INCLUDEES -> graph.getIncludees
                 IncludeDirection.INCLUDERS -> graph.getIncluders
             }
-            call.sync(path, RpcTimeouts.default)
+            runBlockingCancellable { call.startSuspending(path) }
         } catch (e: ProcessCanceledException) {
             throw e
         } catch (e: Throwable) {

@@ -12,7 +12,7 @@ class IncludeTreeStructure(
     private val state: IncludeFilterState,
     private val direction: IncludeDirection,
     private val cache: IncludeGraphCache,
-) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true)) {
+) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state)) {
 
     // Per-structure memos. A new IncludeTreeStructure is created on every doRefresh,
     // so these are pinned to one (scope, query, option) configuration and live for
@@ -38,7 +38,7 @@ class IncludeTreeStructure(
         }
 
         return visibleChildren(file)
-            .map { IncludeNodeDescriptor(myProject, descriptor, it, false) }
+            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state) }
             .toTypedArray()
     }
 
@@ -60,11 +60,11 @@ class IncludeTreeStructure(
     private fun passesQuery(file: PsiFile): Boolean {
         passesQueryCache[file]?.let { return it }
         val result = when {
-            state.matchesQuery(file.name) -> true
+            state.matchesQuery(file) -> true
             // Out-of-scope leaves have no descendants in our tree; only their name matters.
             !acceptsScope(file) -> false
             else -> cache.scopeBoundedReachable(file, direction, state)
-                .any { state.matchesQuery(it.name) }
+                .any { state.matchesQuery(it) }
         }
         passesQueryCache[file] = result
         return result
@@ -77,7 +77,7 @@ class FlatIncludeStructure(
     private val state: IncludeFilterState,
     private val direction: IncludeDirection,
     private val cache: IncludeGraphCache,
-) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true)) {
+) : HierarchyTreeStructure(project, IncludeNodeDescriptor(project, null, baseFile, true, state)) {
 
     override fun buildChildren(descriptor: HierarchyNodeDescriptor): Array<Any> {
         if (descriptor.parentDescriptor != null) return emptyArray()
@@ -85,9 +85,9 @@ class FlatIncludeStructure(
 
         return cache.scopeBoundedReachable(base, direction, state)
             .asSequence()
-            .filter { state.matchesQuery(it.name) }
+            .filter { state.matchesQuery(it) }
             .sortedBy { it.name.lowercase() }
-            .map { IncludeNodeDescriptor(myProject, descriptor, it, false) }
+            .map { IncludeNodeDescriptor(myProject, descriptor, it, false, state) }
             .toList()
             .toTypedArray()
     }

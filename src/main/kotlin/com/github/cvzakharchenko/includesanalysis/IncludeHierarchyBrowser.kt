@@ -11,28 +11,33 @@ import com.intellij.openapi.actionSystem.ActionPlaces
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DataKey
 import com.intellij.openapi.actionSystem.ex.CustomComponentAction
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.actionSystem.Presentation
 import com.intellij.openapi.actionSystem.Separator
 import com.intellij.openapi.actionSystem.ToggleAction
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.SearchTextField
 import com.intellij.util.Alarm
+import com.intellij.util.ui.JBUI
 import java.awt.Dimension
 import java.util.Comparator
 import javax.swing.JComponent
+import javax.swing.JLabel
 import javax.swing.JTree
 import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
 
 class IncludeHierarchyBrowser(
     project: Project,
-    baseFile: PsiFile,
+    private val baseFile: PsiFile,
 ) : HierarchyBrowserBaseEx(project, baseFile) {
 
     private val settings = IncludeHierarchySettings.getInstance()
@@ -41,17 +46,53 @@ class IncludeHierarchyBrowser(
         it.flat = settings.flat
         it.showFirstOutOfScopeLeaf = settings.showFirstOutOfScopeLeaf
         it.skipDuplicateSubtree = settings.skipDuplicateSubtree
+        it.filterByPath = settings.filterByPath
+        it.showFullPath = settings.showFullPath
+        it.autoload = settings.autoload
+        // Seed with a safe scope before the toolbar paints. Without this, the first
+        // buildChildren can race the ScopeChooserCombo render: state.scope is null,
+        // acceptsScope returns true for everything, and out-of-scope files leak in.
+        it.scope = GlobalSearchScope.projectScope(project)
     }
     private val cache = IncludeGraphCache(project)
     private val refreshAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
+    private val loaderRefreshAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
+    private var loaderRefreshPending = false
     private var filterField: SearchTextField? = null
     private var skipCacheClear = false
+    private var progressLabel: JLabel? = null
+    private var loaderProcessed = 0
+    private var loaderDiscovered = 0
+    private var loaderDone = true
+    private val autoloader = IncludeGraphAutoloader(cache) { processed, discovered, done ->
+        SwingUtilities.invokeLater { onLoaderProgress(processed, discovered, done) }
+    }
+
+    init {
+        Disposer.register(this) { autoloader.cancel() }
+    }
 
     companion object {
         const val TYPE_INCLUDEES_TREE: String = "What This File Includes"
         const val TYPE_INCLUDEES_FLAT: String = "What This File Includes (Flat)"
         const val TYPE_INCLUDERS_TREE: String = "What Includes This File"
         const val TYPE_INCLUDERS_FLAT: String = "What Includes This File (Flat)"
+
+        // Lets actions registered in HierarchyViewPopupMenu (in plugin.xml) detect when
+        // they're firing inside the Project Include Hierarchy and reach back to the
+        // browser. HierarchyBrowserBase.BROWSER_DATA_KEY exists but is @ApiStatus.Internal,
+        // and casting it covers every hierarchy view in the IDE — keeping our own key
+        // means our actions only show in our view.
+        val BROWSER_KEY: DataKey<IncludeHierarchyBrowser> = DataKey.create("IncludeHierarchyBrowser")
+    }
+
+    override fun getData(dataId: String): Any? {
+        if (BROWSER_KEY.`is`(dataId)) return this
+        return super.getData(dataId)
+    }
+
+    fun setFilter(text: String) {
+        filterField?.text = text
     }
 
     fun initialViewType(): String = typeNameFor(state)
@@ -80,8 +121,12 @@ class IncludeHierarchyBrowser(
     }
 
     override fun doRefresh(currentBuilderOnly: Boolean) {
-        if (!skipCacheClear) cache.clear()
+        val cacheCleared = !skipCacheClear
+        if (cacheCleared) cache.clear()
         super.doRefresh(currentBuilderOnly)
+        // A user-initiated Refresh blew the cache; the autoloader needs to refill it.
+        // Internal refreshes (skipCacheClear=true) leave the cache and the loader alone.
+        if (cacheCleared) restartAutoload()
     }
 
     override fun getComparator(): Comparator<NodeDescriptor<*>>? = AlphaComparator.INSTANCE
@@ -101,6 +146,7 @@ class IncludeHierarchyBrowser(
         actionGroup.add(OptionsDropdownGroup())
         actionGroup.add(Separator())
         actionGroup.add(FilterFieldAction())
+        actionGroup.add(LoadProgressAction())
         actionGroup.add(Separator())
         super.appendActions(actionGroup, helpID)
     }
@@ -112,29 +158,48 @@ class IncludeHierarchyBrowser(
 
     private fun scheduleRefresh() {
         refreshAlarm.cancelAllRequests()
-        refreshAlarm.addRequest({ refreshCurrentView() }, 200)
+        refreshAlarm.addRequest({ refreshAllViews() }, 200)
     }
 
-    // doRefresh actually rebuilds the structure (changeView with the same type is a no-op).
-    // Skip the cache clear that the Refresh toolbar button performs and restore filter focus
-    // so typing in the filter field doesn't lose focus per keystroke.
-    private fun refreshCurrentView() {
+    // Rebuilds every created view (currentBuilderOnly=false) so that filter / option /
+    // scope changes are visible immediately when the user switches view — otherwise the
+    // non-current view keeps stale cached descriptors until something else dirties it.
+    // Skips the cache clear that the Refresh toolbar button performs, and restores filter
+    // focus so typing in the filter field doesn't lose focus per keystroke.
+    private fun refreshAllViews() {
+        // After changeView the new current tree's model loads its root asynchronously;
+        // doRefresh calls TreeBuilderUtil.storePaths(root, ...) which NPEs on a null root.
+        // Defer until the root is in place.
+        if (!hasCurrentTreeRoot()) {
+            ApplicationManager.getApplication().invokeLater {
+                if (hasCurrentTreeRoot()) refreshAllViews()
+            }
+            return
+        }
         val field = filterField
         val hadFocus = field != null && field.textEditor.hasFocus()
         val caret = field?.textEditor?.caretPosition ?: 0
         skipCacheClear = true
         try {
-            doRefresh(true)
+            // HierarchyBrowserBaseEx.doRefresh → isValidBase → getUncommittedDocuments
+            // asserts read access. Combo/listener-triggered refreshes come in on the EDT
+            // without a read lock, so wrap.
+            ApplicationManager.getApplication().runReadAction { doRefresh(false) }
         } finally {
             skipCacheClear = false
         }
         if (hadFocus) {
             SwingUtilities.invokeLater {
-                field.textEditor.requestFocusInWindow()
+                field!!.textEditor.requestFocusInWindow()
                 val docLen = field.textEditor.document.length
                 field.textEditor.caretPosition = caret.coerceAtMost(docLen)
             }
         }
+    }
+
+    private fun hasCurrentTreeRoot(): Boolean {
+        val tree = runCatching { currentTree }.getOrNull() ?: return false
+        return tree.model?.root != null
     }
 
     private inner class ScopeChooserAction : AnAction(), CustomComponentAction {
@@ -142,13 +207,22 @@ class IncludeHierarchyBrowser(
             val preselect = settings.scopeName ?: "Project Files"
             val combo = ScopeChooserCombo(myProject, false, true, preselect)
             Disposer.register(this@IncludeHierarchyBrowser, combo)
-            state.scope = combo.selectedScope
-            settings.scopeName = combo.selectedScope?.displayName ?: preselect
+            val resolved = combo.selectedScope
+            if (resolved != null) {
+                state.scope = resolved
+                settings.scopeName = resolved.displayName
+                // The tree may have already rendered against the projectScope default
+                // we seeded; refresh so the real (possibly persisted, possibly named)
+                // scope is applied.
+                cache.invalidateScopeBounded()
+                scheduleRefresh()
+            }
             combo.childComponent.addActionListener {
                 state.scope = combo.selectedScope
                 settings.scopeName = combo.selectedScope?.displayName
                 cache.invalidateScopeBounded()
-                scheduleRefresh()
+                refreshAllViews()
+                restartAutoload()
             }
             return combo
         }
@@ -170,6 +244,8 @@ class IncludeHierarchyBrowser(
             state.direction = if (value) IncludeDirection.INCLUDERS else IncludeDirection.INCLUDEES
             settings.direction = state.direction
             changeView(typeNameFor(state))
+            refreshAllViews()
+            restartAutoload()
         }
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
@@ -184,6 +260,7 @@ class IncludeHierarchyBrowser(
             state.flat = value
             settings.flat = value
             changeView(typeNameFor(state))
+            refreshAllViews()
         }
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
@@ -216,6 +293,9 @@ class IncludeHierarchyBrowser(
             templatePresentation.description = "Display options"
             add(ShowOutOfScopeLeafToggleAction())
             add(SkipDuplicateSubtreeToggleAction())
+            add(FilterByPathToggleAction())
+            add(ShowFullPathToggleAction())
+            add(AutoloadToggleAction())
         }
 
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
@@ -231,7 +311,8 @@ class IncludeHierarchyBrowser(
             state.showFirstOutOfScopeLeaf = value
             settings.showFirstOutOfScopeLeaf = value
             cache.invalidateScopeBounded()
-            scheduleRefresh()
+            refreshAllViews()
+            restartAutoload()
         }
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
@@ -245,8 +326,123 @@ class IncludeHierarchyBrowser(
         override fun setSelected(e: AnActionEvent, value: Boolean) {
             state.skipDuplicateSubtree = value
             settings.skipDuplicateSubtree = value
-            scheduleRefresh()
+            refreshAllViews()
         }
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private inner class FilterByPathToggleAction : ToggleAction(
+        "Filter by File Path",
+        "Match the filter against the file's project-relative path; when off, match against the file name only",
+        null,
+    ) {
+        override fun isSelected(e: AnActionEvent): Boolean = state.filterByPath
+        override fun setSelected(e: AnActionEvent, value: Boolean) {
+            state.filterByPath = value
+            settings.filterByPath = value
+            refreshAllViews()
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private inner class ShowFullPathToggleAction : ToggleAction(
+        "Show Full File Path",
+        "Display each file's project-relative path instead of just its name",
+        null,
+    ) {
+        override fun isSelected(e: AnActionEvent): Boolean = state.showFullPath
+        override fun setSelected(e: AnActionEvent, value: Boolean) {
+            state.showFullPath = value
+            settings.showFullPath = value
+            refreshAllViews()
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private inner class AutoloadToggleAction : ToggleAction(
+        "Autoload Full Hierarchy",
+        "Walk the include graph in the background and populate the whole hierarchy without waiting for expansions",
+        null,
+    ) {
+        override fun isSelected(e: AnActionEvent): Boolean = state.autoload
+        override fun setSelected(e: AnActionEvent, value: Boolean) {
+            state.autoload = value
+            settings.autoload = value
+            restartAutoload()
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private inner class LoadProgressAction : AnAction(), CustomComponentAction {
+        override fun createCustomComponent(presentation: Presentation, place: String): JComponent {
+            val label = JLabel("").apply {
+                border = JBUI.Borders.empty(0, 8)
+                toolTipText = "Files processed / files discovered"
+            }
+            progressLabel = label
+            updateProgressLabel()
+            // Trigger the initial run now that the toolbar has materialized; before
+            // this point there's no place to display progress, and the tree builder
+            // hasn't necessarily attached its model.
+            if (state.autoload) restartAutoload()
+            return label
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = Unit
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabledAndVisible = true
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private fun restartAutoload() {
+        autoloader.cancel()
+        loaderRefreshAlarm.cancelAllRequests()
+        loaderRefreshPending = false
+        if (state.autoload) {
+            loaderProcessed = 0
+            loaderDiscovered = 0
+            loaderDone = false
+            updateProgressLabel()
+            autoloader.start(baseFile, state.direction, state)
+        } else {
+            loaderProcessed = 0
+            loaderDiscovered = 0
+            loaderDone = true
+            updateProgressLabel()
+        }
+    }
+
+    private fun onLoaderProgress(processed: Int, discovered: Int, done: Boolean) {
+        loaderProcessed = processed
+        loaderDiscovered = discovered
+        loaderDone = done
+        updateProgressLabel()
+        if (done) {
+            // One final refresh so the last batch lands; cancel any pending throttled
+            // refresh since we're about to do one synchronously anyway.
+            loaderRefreshAlarm.cancelAllRequests()
+            loaderRefreshPending = false
+            refreshAllViews()
+        } else if (!loaderRefreshPending) {
+            // Coalesce mid-load progress bursts into one refresh per ~500ms so the
+            // tree visibly fills in without thrashing the builder.
+            loaderRefreshPending = true
+            loaderRefreshAlarm.addRequest({
+                loaderRefreshPending = false
+                refreshAllViews()
+            }, 500)
+        }
+    }
+
+    private fun updateProgressLabel() {
+        val label = progressLabel ?: return
+        if (!state.autoload) {
+            label.isVisible = false
+            label.text = ""
+        } else {
+            label.isVisible = true
+            label.text = "$loaderProcessed / $loaderDiscovered"
+        }
     }
 }

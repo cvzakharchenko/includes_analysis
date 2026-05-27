@@ -24,5 +24,11 @@
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <keyboard-shortcut keymap="$default" first-keystroke="control alt shift I"/>
         </action>
+        <action id="ProjectIncludeHierarchy.FilterByFileName"
+                class="com.github.cvzakharchenko.includesanalysis.FilterByFileNameAction"
+                text="Filter by File Name"
+                description="Set the include hierarchy filter to the selected file's name">
+            <add-to-group group-id="HierarchyViewPopupMenu" anchor="first"/>
+        </action>
     </actions>
 </idea-plugin>
