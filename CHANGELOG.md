@@ -1,7 +1,11 @@
-<!-- Keep a Changelog guide -> https://keepachangelog.com -->
+# Project Include Hierarchy Changelog
 
-# includes_analysis Changelog
+## Unreleased
 
-## [Unreleased]
 ### Added
-- Initial scaffold created from [IntelliJ Platform Plugin Template](https://github.com/JetBrains/intellij-platform-plugin-template)
+
+- `Navigate | Project Include Hierarchy` action with default shortcut `Ctrl+Alt+Shift+I`.
+- Scope dropdown reusing built-in and custom IntelliJ scopes.
+- Tree and flat-list views for includees and includers.
+- Name/path filter field that keeps parent context in tree mode.
+- Options for direct out-of-scope leaves, repeated includes, full paths, unique descendant counts, and background autoload.

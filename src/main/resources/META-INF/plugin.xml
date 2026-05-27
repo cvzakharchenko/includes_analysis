@@ -1,24 +1,29 @@
-<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
     <id>com.github.cvzakharchenko.includesanalysis</id>
-    <name>includes_analysis</name>
+    <name>Project Include Hierarchy</name>
     <vendor>cvzakharchenko</vendor>
     <description><![CDATA[
-        <p>Adds a scoped C/C++ imports hierarchy for CLion.</p>
+        <p>Adds a <b>Project Include Hierarchy</b> view for C/C++/Objective-C files in CLion.</p>
+        <ul>
+            <li><b>Scope dropdown</b> - reuse IDE scopes, including custom scopes from Settings, so expansion can stay inside the project areas you care about.</li>
+            <li><b>Flat list toggle</b> - collapse the tree into a deduplicated alphabetical list of unique includes.</li>
+            <li><b>Filter field</b> - type to keep matching nodes, with matching descendants preserving their parent context.</li>
+        </ul>
+        <p>Open via <b>Navigate | Project Include Hierarchy</b>, the editor context menu, or the Hierarchy menu while a C/C++ file is open.</p>
     ]]></description>
 
-    <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.clion</depends>
     <depends>org.jetbrains.plugins.clion.radler</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
-
     <actions>
-        <action id="IncludesAnalysis.ScopedImportsHierarchy"
-                class="com.github.cvzakharchenko.includesanalysis.hierarchy.ScopedIncludeHierarchyAction"
-                text="Scoped Imports Hierarchy"
-                description="Open a C/C++ imports hierarchy filtered by an IDE scope">
+        <action id="ProjectIncludeHierarchy.Browse"
+                class="com.github.cvzakharchenko.includesanalysis.BrowseIncludesAction"
+                text="Project Include Hierarchy"
+                description="Show the include hierarchy filtered by scope, with flat-list and text-filter options">
+            <add-to-group group-id="GoToMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <add-to-group group-id="HierarchyGroup" anchor="after" relative-to-action="CppIncludesHierarchy"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt shift I"/>
         </action>
     </actions>
 </idea-plugin>

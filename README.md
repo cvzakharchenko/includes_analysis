@@ -1,45 +1,44 @@
-# includes_analysis
+# Project Include Hierarchy
 
-![Build](https://github.com/cvzakharchenko/includes_analysis/workflows/Build/badge.svg)
-[![Version](https://img.shields.io/jetbrains/plugin/v/MARKETPLACE_ID.svg)](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID)
-[![Downloads](https://img.shields.io/jetbrains/plugin/d/MARKETPLACE_ID.svg)](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID)
+CLion plugin that adds a project-aware include hierarchy view for C/C++/Objective-C files.
 
-## Template ToDo list
-- [x] Create a new [IntelliJ Platform Plugin Template][template] project.
-- [ ] Get familiar with the [template documentation][template].
-- [ ] Adjust the [group](./gradle.properties), as well as the [id](./src/main/resources/META-INF/plugin.xml), [name](./src/main/resources/META-INF/plugin.xml), and [sources package](./src/main/kotlin).
-- [ ] Adjust the plugin [description](./src/main/resources/META-INF/plugin.xml) (see [Tips][docs:plugin-description]) and this README to describe what your plugin does.
-- [ ] Review the [Legal Agreements](https://plugins.jetbrains.com/docs/marketplace/legal-agreements.html?from=IJPluginTemplate).
-- [ ] [Publish a plugin manually](https://plugins.jetbrains.com/docs/intellij/publishing-plugin.html?from=IJPluginTemplate) for the first time.
-- [ ] Set the `MARKETPLACE_ID` in the above README badges. You can obtain it once the plugin is published to JetBrains Marketplace.
-- [ ] Set the [Plugin Signing](https://plugins.jetbrains.com/docs/intellij/plugin-signing.html?from=IJPluginTemplate) related [secrets](https://github.com/JetBrains/intellij-platform-plugin-template#environment-variables).
-- [ ] Set the [Deployment Token](https://plugins.jetbrains.com/docs/marketplace/plugin-upload.html?from=IJPluginTemplate).
-- [ ] Click the <kbd>Watch</kbd> button on the top of the [IntelliJ Platform Plugin Template][template] to be notified about releases containing new features and fixes.
+## Why
 
-This Fancy IntelliJ Platform Plugin is going to be your implementation of the brilliant ideas that you have.
+CLion's built-in include hierarchy can expand into the standard library, toolchain SDKs,
+and system folders such as `C:\Program Files`. This plugin provides a separate hierarchy
+view that reuses IDE scopes, so expansion can stay inside project files or any custom
+scope configured in Settings.
 
-## Installation
+## What It Does
 
-- Using the IDE built-in plugin system:
+Open any C/C++/Objective-C file and choose **Navigate | Project Include Hierarchy**
+or use the default shortcut `Ctrl+Alt+Shift+I`.
 
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>Marketplace</kbd> > <kbd>Search for "includes_analysis"</kbd> >
-  <kbd>Install</kbd>
+- **Scope dropdown**: reuse built-in or custom IntelliJ scopes.
+- **Show Includers toggle**: switch between files included by the current file and files
+  that include the current file.
+- **Flat List toggle**: show a deduplicated alphabetical list for either direction.
+- **Filter field**: filter by file name by default, or by file path when enabled.
+- **Options menu**: show direct out-of-scope leaves, hide repeated includes, show paths,
+  show unique descendant counts, and autoload the hierarchy in the background.
 
-- Using JetBrains Marketplace:
+The result is rendered in the standard Hierarchy tool window, so standard hierarchy
+actions such as refresh, export, and navigation continue to work.
 
-  Go to [JetBrains Marketplace](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID) and install it by clicking the <kbd>Install to ...</kbd> button in case your IDE is running.
+## Build
 
-  You can also download the [latest release](https://plugins.jetbrains.com/plugin/MARKETPLACE_ID/versions) from JetBrains Marketplace and install it manually using
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>⚙️</kbd> > <kbd>Install plugin from disk...</kbd>
+```powershell
+.\gradlew.bat buildPlugin
+```
 
-- Manually:
+The resulting ZIP is in `build/distributions/`.
 
-  Download the [latest release](https://github.com/cvzakharchenko/includes_analysis/releases/latest) and install it manually using
-  <kbd>Settings/Preferences</kbd> > <kbd>Plugins</kbd> > <kbd>⚙️</kbd> > <kbd>Install plugin from disk...</kbd>
+To try it in a sandbox CLion:
 
+```powershell
+.\gradlew.bat runIde
+```
 
----
-Plugin based on the [IntelliJ Platform Plugin Template][template].
+## Compatibility
 
-[template]: https://github.com/JetBrains/intellij-platform-plugin-template
-[docs:plugin-description]: https://plugins.jetbrains.com/docs/intellij/plugin-user-experience.html#plugin-description-and-presentation
+Requires CLion with the bundled Nova/Radler C++ include graph support.
