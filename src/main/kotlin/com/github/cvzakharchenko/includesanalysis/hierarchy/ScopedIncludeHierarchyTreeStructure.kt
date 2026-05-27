@@ -72,7 +72,7 @@ class ScopedIncludeHierarchyTreeStructure(
         val showChildCounts = showChildCountsProvider()
 
         if (descriptor.pruneChildren || !canExpand(descriptor, scope, cache)) {
-            descriptor.updateChildCount(if (showChildCounts) 0 else null)
+            descriptor.updateChildCount(if (showChildCounts) childCountText(0) else null)
             return EMPTY_CHILDREN
         }
 
@@ -91,7 +91,7 @@ class ScopedIncludeHierarchyTreeStructure(
                 )
                 childDescriptor.updateChildCount(
                     if (showChildCounts) {
-                        visibleDescendantCount(childDescriptor, scope, filter, showOutOfScopeLeaves)
+                        visibleDescendantCountText(childDescriptor, scope, filter, showOutOfScopeLeaves)
                     } else {
                         null
                     },
@@ -102,7 +102,7 @@ class ScopedIncludeHierarchyTreeStructure(
 
         descriptor.updateChildCount(
             if (showChildCounts) {
-                childDescriptors.sumOf { childDescriptor -> 1 + childDescriptor.displayedChildCount() }
+                visibleDescendantCountText(descriptor, scope, filter, showOutOfScopeLeaves)
             } else {
                 null
             },
@@ -110,17 +110,25 @@ class ScopedIncludeHierarchyTreeStructure(
         return childDescriptors.toTypedArray()
     }
 
-    private fun visibleDescendantCount(
+    private fun visibleDescendantCountText(
         descriptor: ScopedIncludeHierarchyNodeDescriptor,
         scope: SearchScope,
         filter: IncludeHierarchyFilter,
         showOutOfScopeLeaves: Boolean,
-    ): Int {
+    ): String =
+        childCountText(visibleDescendantPaths(descriptor, scope, filter, showOutOfScopeLeaves).size)
+
+    private fun visibleDescendantPaths(
+        descriptor: ScopedIncludeHierarchyNodeDescriptor,
+        scope: SearchScope,
+        filter: IncludeHierarchyFilter,
+        showOutOfScopeLeaves: Boolean,
+    ): Set<String> {
         if (descriptor.pruneChildren || !canExpand(descriptor, scope, cache)) {
-            return 0
+            return emptySet()
         }
 
-        return cache.visibleDescendantCount(
+        return cache.visibleDescendantPaths(
             descriptor.file,
             scope,
             filter,
@@ -128,8 +136,8 @@ class ScopedIncludeHierarchyTreeStructure(
             ancestorFilePaths(descriptor),
         )
     }
-}
 
+}
 
 class FlatIncludeHierarchyTreeStructure(
     private val projectRef: Project,
@@ -159,13 +167,13 @@ class FlatIncludeHierarchyTreeStructure(
         val showChildCounts = showChildCountsProvider()
         val showOutOfScopeLeaves = showOutOfScopeLeavesProvider()
 
-        descriptor.updateChildCount(if (showChildCounts) files.size else null)
+        descriptor.updateChildCount(if (showChildCounts) childCountText(files.size) else null)
 
         return files.asSequence()
             .sortedWith(CPP_FILE_COMPARATOR)
             .map { childFile ->
                 val childCount = if (showChildCounts) {
-                    cache.visibleDescendantCount(childFile, scope, filter, showOutOfScopeLeaves)
+                    cache.visibleDescendantCountText(childFile, scope, filter, showOutOfScopeLeaves)
                 } else {
                     null
                 }
@@ -192,7 +200,7 @@ class IncludeHierarchyCache(
     private val flatFileCache = Collections.synchronizedMap(mutableMapOf<FlatCacheKey, List<CppFile>>())
     private val filteredFlatFileCache = Collections.synchronizedMap(mutableMapOf<FilteredFlatCacheKey, List<CppFile>>())
     private val visibleChildFileCache = Collections.synchronizedMap(mutableMapOf<VisibleChildrenCacheKey, List<CppFile>>())
-    private val visibleDescendantCountCache = Collections.synchronizedMap(mutableMapOf<VisibleChildrenCacheKey, DescendantCountEntry>())
+    private val visibleDescendantPathCache = Collections.synchronizedMap(mutableMapOf<VisibleChildrenCacheKey, DescendantPathsEntry>())
     private val matchingSubtreeCache = Collections.synchronizedMap(mutableMapOf<MatchingSubtreeCacheKey, Boolean>())
     private val scopeContainsCache = Collections.synchronizedMap(mutableMapOf<ScopeFileCacheKey, Boolean>())
     private val filterMatchCache = ConcurrentHashMap<FilterMatchCacheKey, Boolean>()
@@ -205,7 +213,7 @@ class IncludeHierarchyCache(
         flatFileCache.clear()
         filteredFlatFileCache.clear()
         visibleChildFileCache.clear()
-        visibleDescendantCountCache.clear()
+        visibleDescendantPathCache.clear()
         matchingSubtreeCache.clear()
         scopeContainsCache.clear()
         filterMatchCache.clear()
@@ -253,14 +261,32 @@ class IncludeHierarchyCache(
         filter: IncludeHierarchyFilter,
         showOutOfScopeLeaves: Boolean,
         ancestorPaths: Set<String> = emptySet(),
-    ): Int {
-        val path = file.virtualFile?.path ?: return 0
+    ): Int =
+        visibleDescendantPaths(file, scope, filter, showOutOfScopeLeaves, ancestorPaths).size
+
+    fun visibleDescendantCountText(
+        file: CppFile,
+        scope: SearchScope,
+        filter: IncludeHierarchyFilter,
+        showOutOfScopeLeaves: Boolean,
+        ancestorPaths: Set<String> = emptySet(),
+    ): String =
+        childCountText(visibleDescendantPaths(file, scope, filter, showOutOfScopeLeaves, ancestorPaths).size)
+
+    fun visibleDescendantPaths(
+        file: CppFile,
+        scope: SearchScope,
+        filter: IncludeHierarchyFilter,
+        showOutOfScopeLeaves: Boolean,
+        ancestorPaths: Set<String> = emptySet(),
+    ): Set<String> {
+        val path = file.virtualFile?.path ?: return emptySet()
         val visitingPaths = LinkedHashSet(ancestorPaths)
         if (!visitingPaths.add(path)) {
-            return 0
+            return emptySet()
         }
 
-        return visibleDescendantCountEntry(file, scope, filter, showOutOfScopeLeaves, visitingPaths).count
+        return visibleDescendantPathsEntry(file, scope, filter, showOutOfScopeLeaves, visitingPaths).paths
     }
 
     fun flatFiles(file: CppFile, scope: SearchScope, filter: IncludeHierarchyFilter): List<CppFile> {
@@ -491,47 +517,49 @@ class IncludeHierarchyCache(
         return resultByPath.values.sortedWith(CPP_FILE_COMPARATOR)
     }
 
-    private fun visibleDescendantCountEntry(
+    private fun visibleDescendantPathsEntry(
         file: CppFile,
         scope: SearchScope,
         filter: IncludeHierarchyFilter,
         showOutOfScopeLeaves: Boolean,
         visitingPaths: MutableSet<String>,
-    ): DescendantCountEntry {
-        val path = file.virtualFile?.path ?: return DescendantCountEntry.EMPTY
+    ): DescendantPathsEntry {
+        val path = file.virtualFile?.path ?: return DescendantPathsEntry.EMPTY
         val key = VisibleChildrenCacheKey(path, scope, filter.text, filter.includePath, showOutOfScopeLeaves)
-        synchronized(visibleDescendantCountCache) {
-            visibleDescendantCountCache[key]
+        synchronized(visibleDescendantPathCache) {
+            visibleDescendantPathCache[key]
                 ?.takeUnless { cachedEntry -> cachedEntry.intersects(visitingPaths) }
                 ?.let { return it }
         }
 
-        val entry = buildVisibleDescendantCountEntry(file, scope, filter, showOutOfScopeLeaves, visitingPaths)
+        val entry = buildVisibleDescendantPathsEntry(file, scope, filter, showOutOfScopeLeaves, visitingPaths)
         if (!entry.contextDependent) {
-            synchronized(visibleDescendantCountCache) {
-                visibleDescendantCountCache[key] = entry
+            synchronized(visibleDescendantPathCache) {
+                visibleDescendantPathCache[key] = entry
             }
         }
         return entry
     }
 
-    private fun buildVisibleDescendantCountEntry(
+    private fun buildVisibleDescendantPathsEntry(
         file: CppFile,
         scope: SearchScope,
         filter: IncludeHierarchyFilter,
         showOutOfScopeLeaves: Boolean,
         visitingPaths: MutableSet<String>,
-    ): DescendantCountEntry {
+    ): DescendantPathsEntry {
         ProgressManager.checkCanceled()
-        var count = 0
         var contextDependent = false
         val descendantPaths = linkedSetOf<String>()
+        val guardPaths = linkedSetOf<String>()
 
         for (childFile in visibleChildFiles(file, scope, filter, showOutOfScopeLeaves)) {
             val virtualFile = childFile.virtualFile ?: continue
             val childPath = virtualFile.path
-            count++
-            descendantPaths.add(childPath)
+            guardPaths.add(childPath)
+            if (filter.isEmpty || matchesFilter(childFile, filter)) {
+                descendantPaths.add(childPath)
+            }
 
             if (!contains(scope, childPath, virtualFile)) {
                 continue
@@ -542,20 +570,20 @@ class IncludeHierarchyCache(
                 continue
             }
 
-            val childEntry = visibleDescendantCountEntry(
+            val childEntry = visibleDescendantPathsEntry(
                 childFile,
                 scope,
                 filter,
                 showOutOfScopeLeaves,
                 visitingPaths,
             )
-            count += childEntry.count
             contextDependent = contextDependent || childEntry.contextDependent
             descendantPaths.addAll(childEntry.paths)
+            guardPaths.addAll(childEntry.guardPaths)
             visitingPaths.remove(childPath)
         }
 
-        return DescendantCountEntry(count, descendantPaths, contextDependent)
+        return DescendantPathsEntry(descendantPaths, guardPaths, contextDependent)
     }
 
     private fun buildHasMatchingSubtree(
@@ -646,16 +674,16 @@ class IncludeHierarchyCache(
         val includePath: Boolean,
     )
 
-    private data class DescendantCountEntry(
-        val count: Int,
+    private data class DescendantPathsEntry(
         val paths: Set<String>,
+        val guardPaths: Set<String>,
         val contextDependent: Boolean,
     ) {
         fun intersects(otherPaths: Set<String>): Boolean =
-            otherPaths.any { paths.contains(it) }
+            otherPaths.any { guardPaths.contains(it) }
 
         companion object {
-            val EMPTY = DescendantCountEntry(0, emptySet(), false)
+            val EMPTY = DescendantPathsEntry(emptySet(), emptySet(), false)
         }
     }
 }
@@ -715,7 +743,7 @@ class ScopedIncludeHierarchyNodeDescriptor(
     isBase: Boolean,
     val pruneChildren: Boolean = false,
     private val showFullFilePath: Boolean = false,
-    private var childCount: Int? = null,
+    private var childCount: String? = null,
 ) : HierarchyNodeDescriptor(project, parentDescriptor, file, isBase) {
     override fun update(): Boolean {
         var changed = super.update()
@@ -738,15 +766,12 @@ class ScopedIncludeHierarchyNodeDescriptor(
         return changed
     }
 
-    fun updateChildCount(count: Int?) {
+    fun updateChildCount(count: String?) {
         if (childCount != count) {
             childCount = count
             update()
         }
     }
-
-    fun displayedChildCount(): Int =
-        childCount ?: 0
 
     private fun fileNameAttributes(): TextAttributes? =
         myColor?.let { TextAttributes(it, null, null, null, Font.PLAIN) }
@@ -762,6 +787,8 @@ class ScopedIncludeHierarchyNodeDescriptor(
         }
     }
 }
+
+private fun childCountText(count: Int): String = count.toString()
 
 private fun canExpand(
     descriptor: ScopedIncludeHierarchyNodeDescriptor,

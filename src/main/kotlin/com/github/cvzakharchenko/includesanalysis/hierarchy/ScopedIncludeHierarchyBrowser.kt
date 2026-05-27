@@ -26,21 +26,15 @@ import com.intellij.ui.PopupHandler
 import com.intellij.ui.SearchTextField
 import com.jetbrains.rider.cpp.fileType.psi.CppFile
 import com.jetbrains.rider.model.CppIncludeGraph
-import java.awt.BorderLayout
-import java.awt.Component
-import java.awt.Container
 import java.awt.Dimension
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Supplier
-import javax.swing.JLabel
-import javax.swing.JPanel
 import javax.swing.JTree
 import javax.swing.SwingUtilities
 import javax.swing.Timer
-import javax.swing.border.EmptyBorder
 import javax.swing.event.DocumentEvent
 import javax.swing.tree.DefaultMutableTreeNode
 
@@ -63,12 +57,10 @@ class ScopedIncludeHierarchyBrowser(
     private var showChildCounts = properties.getBoolean(SHOW_CHILD_COUNTS_PROPERTY, false)
     private var autoloadHierarchy = properties.getBoolean(AUTOLOAD_HIERARCHY_PROPERTY, false)
     private var filter = IncludeHierarchyFilter.empty(filterByFilePath)
-    private val autoloadProgressLock = Any()
     private val autoloadFilesLock = Any()
-    private val autoloadUiUpdateQueued = AtomicBoolean(false)
+    private val autoloadRefreshQueued = AtomicBoolean(false)
     private var autoloadFuture: Future<*>? = null
     private var autoloadGeneration = 0
-    private var autoloadProgress = AutoloadProgress(0, 0)
     private val autoloadFilesByPath = LinkedHashMap<String, CppFile>()
     private val filterRefreshTimer = Timer(FILTER_REFRESH_DELAY_MS) {
         refreshFilterResults()
@@ -128,18 +120,7 @@ class ScopedIncludeHierarchyBrowser(
         }
     }
 
-    override fun createLegendPanel(): JPanel =
-        JPanel(BorderLayout()).apply {
-            border = EmptyBorder(2, 6, 2, 6)
-            isVisible = false
-            add(
-                JLabel("Autoload: 0/0").apply {
-                    name = AUTOLOAD_PROGRESS_LABEL_NAME
-                    isVisible = false
-                },
-                BorderLayout.WEST,
-            )
-        }
+    override fun createLegendPanel(): javax.swing.JPanel? = null
 
     override fun doRefresh(currentBuilderOnly: Boolean) {
         cancelAutoload()
@@ -333,29 +314,20 @@ class ScopedIncludeHierarchyBrowser(
     fun startAutoloadIfEnabled() {
         if (autoloadHierarchy) {
             restartAutoload()
-        } else {
-            updateAutoloadProgressLabel()
         }
     }
 
     private fun restartAutoload() {
         cancelAutoload()
         if (!autoloadHierarchy) {
-            synchronized(autoloadProgressLock) {
-                autoloadProgress = AutoloadProgress(0, 0)
-            }
             clearAutoloadFiles()
-            updateAutoloadProgressLabel()
             return
         }
 
         val baseFile = getHierarchyBase() as? CppFile
         if (baseFile == null) {
-            synchronized(autoloadProgressLock) {
-                autoloadProgress = AutoloadProgress(0, 0)
-            }
             clearAutoloadFiles()
-            queueAutoloadUiUpdate()
+            queueAutoloadRefresh()
             return
         }
 
@@ -364,7 +336,7 @@ class ScopedIncludeHierarchyBrowser(
         val cache = cacheFor(viewTypeForCurrentState())
         val scope = selectedScope
         val showLeaves = showOutOfScopeLeaves
-        setAutoloadProgress(generation, AutoloadProgress(0, 1))
+        queueAutoloadRefresh(generation)
         autoloadFuture = ApplicationManager.getApplication().executeOnPooledThread {
             val finalProgress = runCatching {
                 cache.autoloadHierarchy(
@@ -374,9 +346,9 @@ class ScopedIncludeHierarchyBrowser(
                     shouldCancel = {
                         isDisposed || generation != autoloadGeneration || Thread.currentThread().isInterrupted
                     },
-                    onProgress = { progress ->
+                    onProgress = { _ ->
                         if (generation == autoloadGeneration) {
-                            setAutoloadProgress(generation, progress)
+                            queueAutoloadRefresh(generation)
                         }
                     },
                     onDiscoveredFile = { discoveredFile, inScope ->
@@ -388,7 +360,7 @@ class ScopedIncludeHierarchyBrowser(
             }.getOrNull()
 
             if (finalProgress != null && generation == autoloadGeneration) {
-                setAutoloadProgress(generation, finalProgress)
+                queueAutoloadRefresh(generation)
             }
         }
     }
@@ -423,63 +395,25 @@ class ScopedIncludeHierarchyBrowser(
         }
     }
 
-    private fun setAutoloadProgress(generation: Int, progress: AutoloadProgress) {
+    private fun queueAutoloadRefresh(generation: Int = autoloadGeneration) {
         if (generation != autoloadGeneration) {
             return
         }
 
-        synchronized(autoloadProgressLock) {
-            autoloadProgress = progress
-        }
-        queueAutoloadUiUpdate()
-    }
-
-    private fun queueAutoloadUiUpdate() {
-        if (!autoloadUiUpdateQueued.compareAndSet(false, true)) {
+        if (!autoloadRefreshQueued.compareAndSet(false, true)) {
             return
         }
 
         SwingUtilities.invokeLater {
-            autoloadUiUpdateQueued.set(false)
+            autoloadRefreshQueued.set(false)
             if (isDisposed) {
                 return@invokeLater
             }
 
-            updateAutoloadProgressLabel()
             if (autoloadHierarchy) {
                 autoloadRefreshTimer.restart()
             }
         }
-    }
-
-    private fun updateAutoloadProgressLabel() {
-        val progress = synchronized(autoloadProgressLock) {
-            autoloadProgress
-        }
-        val label = findAutoloadProgressLabel(this) ?: return
-        label.text = "Autoload: ${progress.processed}/${progress.discovered}"
-        label.isVisible = autoloadHierarchy
-        label.parent?.isVisible = autoloadHierarchy
-        label.parent?.revalidate()
-        label.parent?.repaint()
-    }
-
-    private fun findAutoloadProgressLabel(component: Component): JLabel? {
-        if (component is JLabel && component.name == AUTOLOAD_PROGRESS_LABEL_NAME) {
-            return component
-        }
-
-        if (component !is Container) {
-            return null
-        }
-
-        for (child in component.components) {
-            val label = findAutoloadProgressLabel(child)
-            if (label != null) {
-                return label
-            }
-        }
-        return null
     }
 
     private fun refreshAutoloadResults() {
@@ -624,7 +558,7 @@ class ScopedIncludeHierarchyBrowser(
         }
     }
 
-    private inner class ShowChildCountsAction : DumbAwareToggleAction("Show Child Counts") {
+    private inner class ShowChildCountsAction : DumbAwareToggleAction("Show Unique Descendant Counts") {
         override fun isSelected(event: AnActionEvent): Boolean = showChildCounts
 
         override fun setSelected(event: AnActionEvent, state: Boolean) {
@@ -689,7 +623,6 @@ class ScopedIncludeHierarchyBrowser(
         private const val SHOW_FULL_FILE_PATH_PROPERTY = PROPERTY_PREFIX + "show.full.file.path"
         private const val SHOW_CHILD_COUNTS_PROPERTY = PROPERTY_PREFIX + "show.child.counts"
         private const val AUTOLOAD_HIERARCHY_PROPERTY = PROPERTY_PREFIX + "autoload.hierarchy"
-        private const val AUTOLOAD_PROGRESS_LABEL_NAME = PROPERTY_PREFIX + "autoload.progress.label"
         private const val AUTOLOAD_REFRESH_DELAY_MS = 500
         private const val SCOPE_CHOOSER_WIDTH = 160
     }
