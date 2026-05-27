@@ -11,7 +11,8 @@ dependencies {
 
     // IntelliJ Platform Gradle Plugin Dependencies Extension - read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin-dependencies-extension.html
     intellijPlatform {
-        intellijIdea("2025.2.6.2")
+        local("C:/Users/k_zakharchanka/AppData/Local/Programs/CLion")
+        bundledPlugins("org.jetbrains.plugins.clion.radler")
         testFramework(TestFrameworkType.Platform)
     }
 }

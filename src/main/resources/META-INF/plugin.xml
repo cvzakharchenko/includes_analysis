@@ -4,16 +4,21 @@
     <name>includes_analysis</name>
     <vendor>cvzakharchenko</vendor>
     <description><![CDATA[
-        <p><b>includes_analysis</b> is a repository that provides a pure template to make it easier to create a new plugin project.</p>
-        <p>The main goal of this template is to speed up the setup phase of plugin development for both new and experienced developers by preconfiguring the project scaffold and CI, linking to the proper documentation pages, and keeping everything organized.</p>
+        <p>Adds a scoped C/C++ imports hierarchy for CLion.</p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.clion</depends>
+    <depends>org.jetbrains.plugins.clion.radler</depends>
 
     <resource-bundle>messages.MyBundle</resource-bundle>
 
-    <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.github.cvzakharchenko.includesanalysis.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="com.github.cvzakharchenko.includesanalysis.startup.MyProjectActivity" />
-    </extensions>
+    <actions>
+        <action id="IncludesAnalysis.ScopedImportsHierarchy"
+                class="com.github.cvzakharchenko.includesanalysis.hierarchy.ScopedIncludeHierarchyAction"
+                text="Scoped Imports Hierarchy"
+                description="Open a C/C++ imports hierarchy filtered by an IDE scope">
+            <add-to-group group-id="HierarchyGroup" anchor="after" relative-to-action="CppIncludesHierarchy"/>
+        </action>
+    </actions>
 </idea-plugin>
