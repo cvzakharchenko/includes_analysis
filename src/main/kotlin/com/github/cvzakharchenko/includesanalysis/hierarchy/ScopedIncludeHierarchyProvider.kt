@@ -22,5 +22,6 @@ class ScopedIncludeHierarchyProvider : HierarchyProvider {
     override fun browserActivated(hierarchyBrowser: HierarchyBrowser) {
         val browser = hierarchyBrowser as ScopedIncludeHierarchyBrowser
         browser.changeView(browser.initialViewType)
+        browser.startAutoloadIfEnabled()
     }
 }

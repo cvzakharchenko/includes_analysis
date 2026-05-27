@@ -2,17 +2,23 @@ package com.github.cvzakharchenko.includesanalysis.hierarchy
 
 import com.intellij.ide.hierarchy.HierarchyNodeDescriptor
 import com.intellij.ide.hierarchy.HierarchyTreeStructure
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.progress.EmptyProgressIndicator
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.runBlockingCancellable
+import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ui.util.CompositeAppearance
+import com.intellij.openapi.util.Computable
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
 import com.intellij.psi.search.SearchScope
 import com.jetbrains.rd.framework.impl.RdCall
 import com.jetbrains.rider.cpp.fileType.psi.CppFile
+import java.awt.Font
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.LinkedHashMap
@@ -31,10 +37,11 @@ class ScopedIncludeHierarchyTreeStructure(
     private val scopeProvider: () -> SearchScope,
     private val filterProvider: () -> IncludeHierarchyFilter,
     private val showOutOfScopeLeavesProvider: () -> Boolean,
-    private val expandRepeatedIncludesProvider: () -> Boolean,
+    private val hideRepeatedIncludesProvider: () -> Boolean,
+    private val showFullFilePathProvider: () -> Boolean,
 ) : HierarchyTreeStructure(
     projectRef,
-    ScopedIncludeHierarchyNodeDescriptor(projectRef, null, file, true),
+    ScopedIncludeHierarchyNodeDescriptor(projectRef, null, file, true, showFullFilePath = showFullFilePathProvider()),
 ) {
     private val buildLock = Any()
     private val childrenByDescriptor = Collections.synchronizedMap(IdentityHashMap<ScopedIncludeHierarchyNodeDescriptor, Array<Any>>())
@@ -60,7 +67,7 @@ class ScopedIncludeHierarchyTreeStructure(
         val scope = scopeProvider()
         val filter = filterProvider()
         val showOutOfScopeLeaves = showOutOfScopeLeavesProvider()
-        val expandRepeatedIncludes = expandRepeatedIncludesProvider()
+        val hideRepeatedIncludes = hideRepeatedIncludesProvider()
 
         if (descriptor.pruneChildren || !canExpand(descriptor, scope, cache)) {
             return EMPTY_CHILDREN
@@ -69,8 +76,15 @@ class ScopedIncludeHierarchyTreeStructure(
         return cache.visibleChildFiles(file, scope, filter, showOutOfScopeLeaves).asSequence()
             .map { childFile ->
                 val childPath = childFile.virtualFile?.path
-                val pruneChildren = !expandRepeatedIncludes && childPath != null && !shownFilePaths.add(childPath)
-                ScopedIncludeHierarchyNodeDescriptor(projectRef, descriptor, childFile, false, pruneChildren)
+                val pruneChildren = hideRepeatedIncludes && childPath != null && !shownFilePaths.add(childPath)
+                ScopedIncludeHierarchyNodeDescriptor(
+                    projectRef,
+                    descriptor,
+                    childFile,
+                    false,
+                    pruneChildren = pruneChildren,
+                    showFullFilePath = showFullFilePathProvider(),
+                )
             }
             .toList()
             .toTypedArray()
@@ -83,9 +97,11 @@ class FlatIncludeHierarchyTreeStructure(
     private val cache: IncludeHierarchyCache,
     private val scopeProvider: () -> SearchScope,
     private val filterProvider: () -> IncludeHierarchyFilter,
+    private val showFullFilePathProvider: () -> Boolean,
+    private val autoloadFilesProvider: () -> List<CppFile>?,
 ) : HierarchyTreeStructure(
     projectRef,
-    ScopedIncludeHierarchyNodeDescriptor(projectRef, null, file, true),
+    ScopedIncludeHierarchyNodeDescriptor(projectRef, null, file, true, showFullFilePath = showFullFilePathProvider()),
 ) {
     override fun buildChildren(nodeDescriptor: HierarchyNodeDescriptor): Array<Any> {
         val descriptor = nodeDescriptor as? ScopedIncludeHierarchyNodeDescriptor ?: return EMPTY_CHILDREN
@@ -93,9 +109,21 @@ class FlatIncludeHierarchyTreeStructure(
             return EMPTY_CHILDREN
         }
 
-        return cache.flatFiles(descriptor.file, scopeProvider(), filterProvider()).asSequence()
+        val filter = filterProvider()
+        val files = autoloadFilesProvider()
+            ?.filter { childFile -> cache.matchesFilter(childFile, filter) }
+            ?: cache.flatFiles(descriptor.file, scopeProvider(), filter)
+
+        return files.asSequence()
+            .sortedWith(CPP_FILE_COMPARATOR)
             .map { childFile ->
-                ScopedIncludeHierarchyNodeDescriptor(projectRef, descriptor, childFile, false)
+                ScopedIncludeHierarchyNodeDescriptor(
+                    projectRef,
+                    descriptor,
+                    childFile,
+                    false,
+                    showFullFilePath = showFullFilePathProvider(),
+                )
             }
             .toList()
             .toTypedArray()
@@ -114,7 +142,7 @@ class IncludeHierarchyCache(
     private val matchingSubtreeCache = Collections.synchronizedMap(mutableMapOf<MatchingSubtreeCacheKey, Boolean>())
     private val scopeContainsCache = Collections.synchronizedMap(mutableMapOf<ScopeFileCacheKey, Boolean>())
     private val filterMatchCache = ConcurrentHashMap<FilterMatchCacheKey, Boolean>()
-    private val searchableTextCache = ConcurrentHashMap<String, String>()
+    private val searchableTextCache = ConcurrentHashMap<SearchableTextCacheKey, String>()
     private val fileCache = Collections.synchronizedMap(mutableMapOf<String, CppFile?>())
 
     fun clear() {
@@ -150,7 +178,7 @@ class IncludeHierarchyCache(
         showOutOfScopeLeaves: Boolean,
     ): List<CppFile> {
         val path = file.virtualFile?.path ?: return emptyList()
-        val key = VisibleChildrenCacheKey(path, scope, filter.text, showOutOfScopeLeaves)
+        val key = VisibleChildrenCacheKey(path, scope, filter.text, filter.includePath, showOutOfScopeLeaves)
         synchronized(visibleChildFileCache) {
             visibleChildFileCache[key]?.let { return it }
         }
@@ -170,7 +198,7 @@ class IncludeHierarchyCache(
         }
 
         val path = file.virtualFile?.path ?: return emptyList()
-        val key = FilteredFlatCacheKey(path, scope, filter.text)
+        val key = FilteredFlatCacheKey(path, scope, filter.text, filter.includePath)
         synchronized(filteredFlatFileCache) {
             filteredFlatFileCache[key]?.let { return it }
         }
@@ -201,13 +229,67 @@ class IncludeHierarchyCache(
         return contains(scope, virtualFile.path, virtualFile)
     }
 
+    fun autoloadHierarchy(
+        rootFile: CppFile,
+        scope: SearchScope,
+        showOutOfScopeLeaves: Boolean,
+        shouldCancel: () -> Boolean,
+        onProgress: (AutoloadProgress) -> Unit,
+        onDiscoveredFile: (CppFile, Boolean) -> Unit = { _, _ -> },
+    ): AutoloadProgress {
+        val rootPath = rootFile.virtualFile?.path ?: return AutoloadProgress(0, 0)
+        val discoveredPaths = hashSetOf(rootPath)
+        val queue = ArrayDeque<CppFile>()
+        var processed = 0
+        var discovered = 1
+
+        queue.add(rootFile)
+        onProgress(AutoloadProgress(processed, discovered))
+
+        while (queue.isNotEmpty()) {
+            ProgressManager.checkCanceled()
+            if (shouldCancel()) {
+                break
+            }
+
+            val currentFile = queue.removeFirst()
+            for (childFile in childFiles(currentFile)) {
+                if (shouldCancel()) {
+                    break
+                }
+
+                val virtualFile = childFile.virtualFile ?: continue
+                val childPath = virtualFile.path
+                if (!discoveredPaths.add(childPath)) {
+                    continue
+                }
+
+                val inScope = contains(scope, childPath, virtualFile)
+                if (inScope) {
+                    discovered++
+                    onDiscoveredFile(childFile, true)
+                    queue.addLast(childFile)
+                } else if (showOutOfScopeLeaves) {
+                    discovered++
+                    onDiscoveredFile(childFile, false)
+                    processed++
+                }
+            }
+
+            processed++
+            onProgress(AutoloadProgress(processed, discovered))
+        }
+
+        return AutoloadProgress(processed, discovered)
+    }
+
     fun hasMatchingSubtree(file: CppFile, scope: SearchScope, filter: IncludeHierarchyFilter): Boolean {
         if (filter.isEmpty) {
             return true
         }
 
         val path = file.virtualFile?.path ?: return false
-        val key = MatchingSubtreeCacheKey(path, scope, filter.text)
+        val key = MatchingSubtreeCacheKey(path, scope, filter.text, filter.includePath)
         synchronized(matchingSubtreeCache) {
             matchingSubtreeCache[key]?.let { return it }
         }
@@ -248,36 +330,38 @@ class IncludeHierarchyCache(
         return inScope && hasMatchingSubtree(childFile, scope, filter)
     }
 
-    private fun contains(scope: SearchScope, path: String, virtualFile: com.intellij.openapi.vfs.VirtualFile): Boolean {
+    private fun contains(scope: SearchScope, path: String, virtualFile: VirtualFile): Boolean {
         val key = ScopeFileCacheKey(scope, path)
         synchronized(scopeContainsCache) {
             scopeContainsCache[key]?.let { return it }
         }
 
-        val result = scope.contains(virtualFile)
+        val result = ApplicationManager.getApplication().runReadAction<Boolean> {
+            scope.contains(virtualFile)
+        }
         synchronized(scopeContainsCache) {
             scopeContainsCache[key] = result
         }
         return result
     }
 
-    private fun matchesFilter(file: CppFile, filter: IncludeHierarchyFilter): Boolean {
+    fun matchesFilter(file: CppFile, filter: IncludeHierarchyFilter): Boolean {
         if (filter.isEmpty) {
             return true
         }
 
         val path = file.virtualFile?.path ?: file.name
-        return filterMatchCache.computeIfAbsent(FilterMatchCacheKey(path, filter.text)) {
-            filter.matches(searchableText(file, path))
+        return filterMatchCache.computeIfAbsent(FilterMatchCacheKey(path, filter.text, filter.includePath)) {
+            filter.matches(searchableText(file, path, filter.includePath))
         }
     }
 
-    private fun searchableText(file: CppFile, cacheKey: String): String =
-        searchableTextCache.computeIfAbsent(cacheKey) {
+    private fun searchableText(file: CppFile, cacheKey: String, includePath: Boolean): String =
+        searchableTextCache.computeIfAbsent(SearchableTextCacheKey(cacheKey, includePath)) {
             val virtualFile = file.virtualFile
             buildString {
                 append(file.name)
-                if (virtualFile != null) {
+                if (includePath && virtualFile != null) {
                     append(' ')
                     append(virtualFile.path)
                 }
@@ -286,13 +370,24 @@ class IncludeHierarchyCache(
 
     private fun loadChildPaths(path: String): List<String> =
         try {
-            runBlockingCancellable {
-                getChildrenCall.startSuspending(path)
+            val progressManager = ProgressManager.getInstance()
+            if (progressManager.hasProgressIndicator()) {
+                loadChildPathsCancellable(path)
+            } else {
+                progressManager.runProcess(
+                    Computable { loadChildPathsCancellable(path) },
+                    EmptyProgressIndicator(),
+                )
             }
         } catch (e: ProcessCanceledException) {
             throw e
         } catch (_: RuntimeException) {
             emptyList()
+        }
+
+    private fun loadChildPathsCancellable(path: String): List<String> =
+        runBlockingCancellable {
+            getChildrenCall.startSuspending(path)
         }
 
     private fun buildFlatFiles(file: CppFile, scope: SearchScope): List<CppFile> {
@@ -359,7 +454,11 @@ class IncludeHierarchyCache(
         }
 
         val virtualFile = LocalFileSystem.getInstance().findFileByPath(path)
-        val file = virtualFile?.let { PsiManager.getInstance(projectRef).findFile(it) } as? CppFile
+        val file = virtualFile?.let {
+            ApplicationManager.getApplication().runReadAction<CppFile?> {
+                PsiManager.getInstance(projectRef).findFile(it) as? CppFile
+            }
+        }
         synchronized(fileCache) {
             fileCache[path] = file
         }
@@ -375,12 +474,14 @@ class IncludeHierarchyCache(
         val rootPath: String,
         val scope: SearchScope,
         val filter: String,
+        val includePath: Boolean,
     )
 
     private data class VisibleChildrenCacheKey(
         val rootPath: String,
         val scope: SearchScope,
         val filter: String,
+        val includePath: Boolean,
         val showOutOfScopeLeaves: Boolean,
     )
 
@@ -388,6 +489,7 @@ class IncludeHierarchyCache(
         val rootPath: String,
         val scope: SearchScope,
         val filter: String,
+        val includePath: Boolean,
     )
 
     private data class ScopeFileCacheKey(
@@ -398,11 +500,23 @@ class IncludeHierarchyCache(
     private data class FilterMatchCacheKey(
         val path: String,
         val filter: String,
+        val includePath: Boolean,
+    )
+
+    private data class SearchableTextCacheKey(
+        val path: String,
+        val includePath: Boolean,
     )
 }
 
+data class AutoloadProgress(
+    val processed: Int,
+    val discovered: Int,
+)
+
 class IncludeHierarchyFilter private constructor(
     val text: String,
+    val includePath: Boolean,
     private val terms: List<String>,
 ) {
     val isEmpty: Boolean
@@ -417,23 +531,26 @@ class IncludeHierarchyFilter private constructor(
     }
 
     override fun equals(other: Any?): Boolean =
-        other is IncludeHierarchyFilter && text == other.text
+        other is IncludeHierarchyFilter && text == other.text && includePath == other.includePath
 
-    override fun hashCode(): Int = text.hashCode()
+    override fun hashCode(): Int = 31 * text.hashCode() + includePath.hashCode()
 
     companion object {
-        private val EMPTY = IncludeHierarchyFilter("", emptyList())
+        private val EMPTY_BY_NAME = IncludeHierarchyFilter("", false, emptyList())
+        private val EMPTY_BY_PATH = IncludeHierarchyFilter("", true, emptyList())
 
-        fun empty(): IncludeHierarchyFilter = EMPTY
+        fun empty(includePath: Boolean = false): IncludeHierarchyFilter =
+            if (includePath) EMPTY_BY_PATH else EMPTY_BY_NAME
 
-        fun from(text: String): IncludeHierarchyFilter {
+        fun from(text: String, includePath: Boolean = false): IncludeHierarchyFilter {
             val normalized = text.trim().lowercase()
             if (normalized.isEmpty()) {
-                return EMPTY
+                return empty(includePath)
             }
 
             return IncludeHierarchyFilter(
                 normalized,
+                includePath,
                 normalized.split(Regex("\\s+")).filter { it.isNotEmpty() },
             )
         }
@@ -446,16 +563,40 @@ class ScopedIncludeHierarchyNodeDescriptor(
     val file: CppFile,
     isBase: Boolean,
     val pruneChildren: Boolean = false,
+    private val showFullFilePath: Boolean = false,
 ) : HierarchyNodeDescriptor(project, parentDescriptor, file, isBase) {
     override fun update(): Boolean {
+        var changed = super.update()
         val previousText = highlightedText.text
 
         val virtualFile = file.virtualFile
-        val text = if (virtualFile == null) file.name else "${file.name} (${virtualFile.parent?.path ?: virtualFile.path})"
-        myHighlightedText = CompositeAppearance.single(text)
+        val text = CompositeAppearance()
+        text.ending.addText(file.name, fileNameAttributes())
+        if (showFullFilePath && virtualFile != null) {
+            text.ending.addText(" (${displayPath(virtualFile.path)})", getPackageNameAttributes())
+        }
+        myHighlightedText = text
+        myName = highlightedText.text
         installIcon(file, false)
 
-        return previousText != highlightedText.text
+        if (previousText != highlightedText.text) {
+            changed = true
+        }
+        return changed
+    }
+
+    private fun fileNameAttributes(): TextAttributes? =
+        myColor?.let { TextAttributes(it, null, null, null, Font.PLAIN) }
+
+    private fun displayPath(path: String): String {
+        val basePath = myProject.basePath?.replace('\\', '/') ?: return path
+        val normalizedPath = path.replace('\\', '/')
+        val root = basePath.trimEnd('/')
+        return when {
+            normalizedPath == root -> file.name
+            normalizedPath.startsWith("$root/") -> normalizedPath.removePrefix("$root/")
+            else -> path
+        }
     }
 }
 

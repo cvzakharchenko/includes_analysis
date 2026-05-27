@@ -8,10 +8,12 @@ import com.intellij.ide.util.treeView.AlphaComparator
 import com.intellij.ide.util.treeView.NodeDescriptor
 import com.intellij.ide.util.scopeChooser.ScopeChooserCombo
 import com.intellij.openapi.actionSystem.ActionGroup
+import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.actionSystem.ex.DefaultCustomComponentAction
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.DumbAwareToggleAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
@@ -24,7 +26,13 @@ import com.intellij.ui.PopupHandler
 import com.intellij.ui.SearchTextField
 import com.jetbrains.rider.cpp.fileType.psi.CppFile
 import com.jetbrains.rider.model.CppIncludeGraph
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Supplier
+import javax.swing.JLabel
+import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.JPanel
 import javax.swing.JTree
 import javax.swing.SwingUtilities
@@ -38,22 +46,40 @@ class ScopedIncludeHierarchyBrowser(
 ) : HierarchyBrowserBaseEx(projectRef, file) {
     private val properties = PropertiesComponent.getInstance(projectRef)
     private var selectedScope: SearchScope = GlobalSearchScope.projectScope(projectRef)
-    private val includingCache = IncludeHierarchyCache(projectRef, includeGraph.getIncluders)
-    private val includedByCache = IncludeHierarchyCache(projectRef, includeGraph.getIncludees)
+    private val includeesCache = IncludeHierarchyCache(projectRef, includeGraph.getIncludees)
+    private val includersCache = IncludeHierarchyCache(projectRef, includeGraph.getIncluders)
     private var flatMode = properties.getBoolean(FLAT_MODE_PROPERTY, false)
-    private var showIncludedBy = properties.getBoolean(SHOW_INCLUDED_BY_PROPERTY, false)
-    private var showOutOfScopeLeaves = properties.getBoolean(SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY, true)
-    private var expandRepeatedIncludes = properties.getBoolean(EXPAND_REPEATED_INCLUDES_PROPERTY, false)
-    private var filter = IncludeHierarchyFilter.empty()
+    private var showIncluders = properties.getBoolean(SHOW_INCLUDERS_PROPERTY, false)
+    private var showOutOfScopeLeaves = properties.getBoolean(SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY, false)
+    private var hideRepeatedIncludes = properties.getBoolean(HIDE_REPEATED_INCLUDES_PROPERTY, false)
+    private var filterByFilePath = properties.getBoolean(FILTER_BY_FILE_PATH_PROPERTY, false)
+    private var showFullFilePath = properties.getBoolean(SHOW_FULL_FILE_PATH_PROPERTY, false)
+    private var autoloadHierarchy = properties.getBoolean(AUTOLOAD_HIERARCHY_PROPERTY, false)
+    private var filter = IncludeHierarchyFilter.empty(filterByFilePath)
+    private val autoloadProgressLock = Any()
+    private val autoloadFilesLock = Any()
+    private val autoloadUiUpdateQueued = AtomicBoolean(false)
+    private var autoloadFuture: Future<*>? = null
+    private var autoloadGeneration = 0
+    private var autoloadProgress = AutoloadProgress(0, 0)
+    private val autoloadFilesByPath = LinkedHashMap<String, CppFile>()
+    private val autoloadProgressLabel = JLabel("0/0").apply {
+        isVisible = autoloadHierarchy
+    }
     private val filterRefreshTimer = Timer(FILTER_REFRESH_DELAY_MS) {
         refreshFilterResults()
+    }.apply {
+        isRepeats = false
+    }
+    private val autoloadRefreshTimer = Timer(AUTOLOAD_REFRESH_DELAY_MS) {
+        refreshAutoloadResults()
     }.apply {
         isRepeats = false
     }
     private val filterField: SearchTextField by lazy { createFilterField() }
 
     val initialViewType: String
-        get() = if (showIncludedBy) INCLUDED_BY_VIEW else INCLUDING_VIEW
+        get() = viewTypeForCurrentState()
 
     override fun getElementFromDescriptor(descriptor: HierarchyNodeDescriptor): PsiElement? =
         (descriptor as? ScopedIncludeHierarchyNodeDescriptor)?.file
@@ -71,8 +97,16 @@ class ScopedIncludeHierarchyBrowser(
     override fun createHierarchyTreeStructure(typeName: String, element: PsiElement): HierarchyTreeStructure? {
         val file = element as? CppFile ?: return null
         val cache = cacheFor(typeName)
-        return if (flatMode) {
-            FlatIncludeHierarchyTreeStructure(projectRef, file, cache, { selectedScope }) { filter }
+        return if (isFlatView(typeName)) {
+            FlatIncludeHierarchyTreeStructure(
+                projectRef,
+                file,
+                cache,
+                { selectedScope },
+                { filter },
+                { showFullFilePath },
+                { autoloadFilesSnapshot() },
+            )
         } else {
             ScopedIncludeHierarchyTreeStructure(
                 projectRef,
@@ -81,7 +115,8 @@ class ScopedIncludeHierarchyBrowser(
                 { selectedScope },
                 { filter },
                 { showOutOfScopeLeaves },
-                { expandRepeatedIncludes },
+                { hideRepeatedIncludes },
+                { showFullFilePath },
             )
         }
     }
@@ -89,9 +124,11 @@ class ScopedIncludeHierarchyBrowser(
     override fun createLegendPanel(): JPanel? = null
 
     override fun doRefresh(currentBuilderOnly: Boolean) {
-        includingCache.clear()
-        includedByCache.clear()
+        cancelAutoload()
+        includeesCache.clear()
+        includersCache.clear()
         refreshTree(currentBuilderOnly)
+        startAutoloadIfEnabled()
     }
 
     private fun rebuildWithoutClearingCaches(currentBuilderOnly: Boolean) {
@@ -121,27 +158,61 @@ class ScopedIncludeHierarchyBrowser(
     }
 
     override fun createTrees(trees: MutableMap<in String, in JTree>) {
-        val popupGroup = DefaultActionGroup() as ActionGroup
+        val popupGroup = DefaultActionGroup().apply {
+            add(FilterByFileNameAction())
+        } as ActionGroup
 
-        val includingTree = createTree(true)
-        PopupHandler.installPopupMenu(includingTree, popupGroup, "TypeHierarchyViewPopup")
-        trees[INCLUDING_VIEW] = includingTree
+        val includeesTree = createIncludeTree(popupGroup)
+        trees[INCLUDEES_TREE_VIEW] = includeesTree
 
-        val includedByTree = createTree(true)
-        PopupHandler.installPopupMenu(includedByTree, popupGroup, "TypeHierarchyViewPopup")
-        trees[INCLUDED_BY_VIEW] = includedByTree
+        val includeesFlatTree = createIncludeTree(popupGroup)
+        trees[INCLUDEES_FLAT_VIEW] = includeesFlatTree
+
+        val includersTree = createIncludeTree(popupGroup)
+        trees[INCLUDERS_TREE_VIEW] = includersTree
+
+        val includersFlatTree = createIncludeTree(popupGroup)
+        trees[INCLUDERS_FLAT_VIEW] = includersFlatTree
+    }
+
+    private fun createIncludeTree(popupGroup: ActionGroup): JTree {
+        val tree = createTree(true)
+        tree.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(event: MouseEvent) {
+                selectPopupRow(event)
+            }
+
+            override fun mouseReleased(event: MouseEvent) {
+                selectPopupRow(event)
+            }
+        })
+        PopupHandler.installPopupMenu(tree, popupGroup, "TypeHierarchyViewPopup")
+        return tree
+    }
+
+    private fun selectPopupRow(event: MouseEvent) {
+        if (!event.isPopupTrigger && !SwingUtilities.isRightMouseButton(event)) {
+            return
+        }
+
+        val tree = event.source as? JTree ?: return
+        val path = tree.getPathForLocation(event.x, event.y) ?: return
+        tree.selectionPath = path
     }
 
     override fun getPresentableNameMap(): MutableMap<String, Supplier<String>> =
         hashMapOf(
-            INCLUDING_VIEW to Supplier { "Including" },
-            INCLUDED_BY_VIEW to Supplier { "Included By" },
+            INCLUDEES_TREE_VIEW to Supplier { "Includes" },
+            INCLUDEES_FLAT_VIEW to Supplier { "Includes Flat" },
+            INCLUDERS_TREE_VIEW to Supplier { "Includers" },
+            INCLUDERS_FLAT_VIEW to Supplier { "Includers Flat" },
         )
 
     override fun prependActions(actionGroup: DefaultActionGroup) {
         actionGroup.add(DirectionModeAction())
         actionGroup.add(FlatModeAction())
         actionGroup.add(OptionsGroup())
+        actionGroup.add(DefaultCustomComponentAction { autoloadProgressLabel })
         actionGroup.add(DefaultCustomComponentAction { filterField })
         actionGroup.add(DefaultCustomComponentAction { createScopeChooser() })
         super.prependActions(actionGroup)
@@ -155,6 +226,7 @@ class ScopedIncludeHierarchyBrowser(
             if (scope != selectedScope) {
                 selectedScope = scope
                 rebuildWithoutClearingCaches(false)
+                restartAutoload()
             }
         }
         Disposer.register(this, chooser)
@@ -167,7 +239,7 @@ class ScopedIncludeHierarchyBrowser(
         field.textEditor.columns = 18
         field.addDocumentListener(object : DocumentAdapter() {
             override fun textChanged(event: DocumentEvent) {
-                val nextFilter = IncludeHierarchyFilter.from(field.text)
+                val nextFilter = IncludeHierarchyFilter.from(field.text, filterByFilePath)
                 if (nextFilter != filter) {
                     filter = nextFilter
                     filterRefreshTimer.restart()
@@ -178,26 +250,215 @@ class ScopedIncludeHierarchyBrowser(
     }
 
     private fun cacheFor(typeName: String): IncludeHierarchyCache =
-        if (typeName == INCLUDED_BY_VIEW) {
-            includedByCache
+        if (isIncludersView(typeName)) {
+            includersCache
         } else {
-            includingCache
+            includeesCache
         }
 
-    private inner class DirectionModeAction : DumbAwareToggleAction("Included By") {
+    private fun viewTypeForCurrentState(): String =
+        when {
+            showIncluders && flatMode -> INCLUDERS_FLAT_VIEW
+            showIncluders -> INCLUDERS_TREE_VIEW
+            flatMode -> INCLUDEES_FLAT_VIEW
+            else -> INCLUDEES_TREE_VIEW
+        }
+
+    private fun switchToCurrentView() {
+        val typeName = viewTypeForCurrentState()
+        val needsRefresh = hasViewModel(typeName)
+        changeView(typeName, false)
+        if (needsRefresh) {
+            rebuildWithoutClearingCaches(true)
+        }
+    }
+
+    private fun selectedDescriptorFile(): CppFile? {
+        val tree = runCatching { currentTree }.getOrNull() ?: return null
+        val node = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode ?: return null
+        return (node.userObject as? ScopedIncludeHierarchyNodeDescriptor)?.file
+    }
+
+    private fun replaceFilterText(text: String) {
+        val editor = filterField.textEditor
+        if (editor.text == text) {
+            val nextFilter = IncludeHierarchyFilter.from(text, filterByFilePath)
+            if (nextFilter != filter) {
+                filter = nextFilter
+                filterRefreshTimer.restart()
+            }
+        } else {
+            editor.text = text
+        }
+
+        editor.caretPosition = editor.document.length
+        editor.requestFocusInWindow()
+    }
+
+    fun startAutoloadIfEnabled() {
+        if (autoloadHierarchy) {
+            restartAutoload()
+        } else {
+            updateAutoloadProgressLabel()
+        }
+    }
+
+    private fun restartAutoload() {
+        cancelAutoload()
+        if (!autoloadHierarchy) {
+            synchronized(autoloadProgressLock) {
+                autoloadProgress = AutoloadProgress(0, 0)
+            }
+            clearAutoloadFiles()
+            updateAutoloadProgressLabel()
+            return
+        }
+
+        val baseFile = getHierarchyBase() as? CppFile
+        if (baseFile == null) {
+            synchronized(autoloadProgressLock) {
+                autoloadProgress = AutoloadProgress(0, 0)
+            }
+            clearAutoloadFiles()
+            queueAutoloadUiUpdate()
+            return
+        }
+
+        clearAutoloadFiles()
+        val generation = autoloadGeneration
+        val cache = cacheFor(viewTypeForCurrentState())
+        val scope = selectedScope
+        val showLeaves = showOutOfScopeLeaves
+        setAutoloadProgress(generation, AutoloadProgress(0, 1))
+        autoloadFuture = ApplicationManager.getApplication().executeOnPooledThread {
+            val finalProgress = runCatching {
+                cache.autoloadHierarchy(
+                    baseFile,
+                    scope,
+                    showLeaves,
+                    shouldCancel = {
+                        isDisposed || generation != autoloadGeneration || Thread.currentThread().isInterrupted
+                    },
+                    onProgress = { progress ->
+                        if (generation == autoloadGeneration) {
+                            setAutoloadProgress(generation, progress)
+                        }
+                    },
+                    onDiscoveredFile = { discoveredFile, inScope ->
+                        if (generation == autoloadGeneration && inScope) {
+                            rememberAutoloadFile(discoveredFile)
+                        }
+                    },
+                )
+            }.getOrNull()
+
+            if (finalProgress != null && generation == autoloadGeneration) {
+                setAutoloadProgress(generation, finalProgress)
+            }
+        }
+    }
+
+    private fun cancelAutoload() {
+        autoloadGeneration++
+        autoloadFuture?.cancel(true)
+        autoloadFuture = null
+        autoloadRefreshTimer.stop()
+    }
+
+    private fun clearAutoloadFiles() {
+        synchronized(autoloadFilesLock) {
+            autoloadFilesByPath.clear()
+        }
+    }
+
+    private fun rememberAutoloadFile(file: CppFile) {
+        val path = file.virtualFile?.path ?: return
+        synchronized(autoloadFilesLock) {
+            autoloadFilesByPath[path] = file
+        }
+    }
+
+    private fun autoloadFilesSnapshot(): List<CppFile>? {
+        if (!autoloadHierarchy) {
+            return null
+        }
+
+        return synchronized(autoloadFilesLock) {
+            autoloadFilesByPath.values.toList()
+        }
+    }
+
+    private fun setAutoloadProgress(generation: Int, progress: AutoloadProgress) {
+        if (generation != autoloadGeneration) {
+            return
+        }
+
+        synchronized(autoloadProgressLock) {
+            autoloadProgress = progress
+        }
+        queueAutoloadUiUpdate()
+    }
+
+    private fun queueAutoloadUiUpdate() {
+        if (!autoloadUiUpdateQueued.compareAndSet(false, true)) {
+            return
+        }
+
+        SwingUtilities.invokeLater {
+            autoloadUiUpdateQueued.set(false)
+            if (isDisposed) {
+                return@invokeLater
+            }
+
+            updateAutoloadProgressLabel()
+            if (autoloadHierarchy) {
+                autoloadRefreshTimer.restart()
+            }
+        }
+    }
+
+    private fun updateAutoloadProgressLabel() {
+        val progress = synchronized(autoloadProgressLock) {
+            autoloadProgress
+        }
+        autoloadProgressLabel.text = "${progress.processed}/${progress.discovered}"
+        autoloadProgressLabel.isVisible = autoloadHierarchy
+    }
+
+    private fun refreshAutoloadResults() {
+        if (!autoloadHierarchy || isDisposed) {
+            return
+        }
+
+        rebuildWithoutClearingCaches(true)
+    }
+
+    private fun hasViewModel(typeName: String): Boolean =
+        runCatching {
+            getTreeModel(typeName)
+            true
+        }.getOrDefault(false)
+
+    private fun isFlatView(typeName: String): Boolean =
+        typeName == INCLUDEES_FLAT_VIEW || typeName == INCLUDERS_FLAT_VIEW
+
+    private fun isIncludersView(typeName: String): Boolean =
+        typeName == INCLUDERS_TREE_VIEW || typeName == INCLUDERS_FLAT_VIEW
+
+    private inner class DirectionModeAction : DumbAwareToggleAction("Show Includers") {
         init {
             templatePresentation.description = "Show files that include the current file"
-            templatePresentation.icon = AllIcons.General.Tree
+            templatePresentation.icon = AllIcons.Hierarchy.Supertypes
         }
 
-        override fun isSelected(event: AnActionEvent): Boolean = showIncludedBy
+        override fun isSelected(event: AnActionEvent): Boolean = showIncluders
 
         override fun setSelected(event: AnActionEvent, state: Boolean) {
-            if (showIncludedBy != state) {
-                showIncludedBy = state
-                properties.setValue(SHOW_INCLUDED_BY_PROPERTY, showIncludedBy, false)
-                changeView(if (showIncludedBy) INCLUDED_BY_VIEW else INCLUDING_VIEW)
-                rebuildWithoutClearingCaches(true)
+            if (showIncluders != state) {
+                showIncluders = state
+                properties.setValue(SHOW_INCLUDERS_PROPERTY, showIncluders, false)
+                switchToCurrentView()
+                restartAutoload()
             }
         }
     }
@@ -238,7 +499,7 @@ class ScopedIncludeHierarchyBrowser(
             if (flatMode != state) {
                 flatMode = state
                 properties.setValue(FLAT_MODE_PROPERTY, flatMode, false)
-                rebuildWithoutClearingCaches(false)
+                switchToCurrentView()
             }
         }
     }
@@ -247,48 +508,114 @@ class ScopedIncludeHierarchyBrowser(
         init {
             templatePresentation.description = "Include hierarchy options"
             templatePresentation.icon = AllIcons.General.GearPlain
+            add(AutoloadHierarchyAction())
             add(ShowOutOfScopeLeavesAction())
-            add(ExpandRepeatedIncludesAction())
+            add(HideRepeatedIncludesAction())
+            add(FilterByFilePathAction())
+            add(ShowFullFilePathAction())
         }
     }
 
-    private inner class ShowOutOfScopeLeavesAction : DumbAwareToggleAction("Show Out-of-Scope Leaves") {
+    private inner class ShowOutOfScopeLeavesAction : DumbAwareToggleAction("Show Direct Out-of-Scope Leaves") {
         override fun isSelected(event: AnActionEvent): Boolean = showOutOfScopeLeaves
 
         override fun setSelected(event: AnActionEvent, state: Boolean) {
             if (showOutOfScopeLeaves != state) {
                 showOutOfScopeLeaves = state
-                properties.setValue(SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY, showOutOfScopeLeaves, true)
+                properties.setValue(SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY, showOutOfScopeLeaves, false)
+                rebuildWithoutClearingCaches(false)
+                restartAutoload()
+            }
+        }
+    }
+
+    private inner class HideRepeatedIncludesAction : DumbAwareToggleAction("Hide Repeated Includes") {
+        override fun isSelected(event: AnActionEvent): Boolean = hideRepeatedIncludes
+
+        override fun setSelected(event: AnActionEvent, state: Boolean) {
+            if (hideRepeatedIncludes != state) {
+                hideRepeatedIncludes = state
+                properties.setValue(HIDE_REPEATED_INCLUDES_PROPERTY, hideRepeatedIncludes, false)
                 rebuildWithoutClearingCaches(false)
             }
         }
     }
 
-    private inner class ExpandRepeatedIncludesAction : DumbAwareToggleAction("Expand Repeated Includes") {
-        override fun isSelected(event: AnActionEvent): Boolean = expandRepeatedIncludes
+    private inner class FilterByFilePathAction : DumbAwareToggleAction("Filter by File Path") {
+        override fun isSelected(event: AnActionEvent): Boolean = filterByFilePath
 
         override fun setSelected(event: AnActionEvent, state: Boolean) {
-            if (expandRepeatedIncludes != state) {
-                expandRepeatedIncludes = state
-                properties.setValue(EXPAND_REPEATED_INCLUDES_PROPERTY, expandRepeatedIncludes, false)
+            if (filterByFilePath != state) {
+                filterByFilePath = state
+                properties.setValue(FILTER_BY_FILE_PATH_PROPERTY, filterByFilePath, false)
+                filter = IncludeHierarchyFilter.from(filterField.text, filterByFilePath)
                 rebuildWithoutClearingCaches(false)
+            }
+        }
+    }
+
+    private inner class ShowFullFilePathAction : DumbAwareToggleAction("Show Full File Path") {
+        override fun isSelected(event: AnActionEvent): Boolean = showFullFilePath
+
+        override fun setSelected(event: AnActionEvent, state: Boolean) {
+            if (showFullFilePath != state) {
+                showFullFilePath = state
+                properties.setValue(SHOW_FULL_FILE_PATH_PROPERTY, showFullFilePath, false)
+                rebuildWithoutClearingCaches(false)
+            }
+        }
+    }
+
+    private inner class FilterByFileNameAction : DumbAwareAction("Filter by File Name") {
+        init {
+            templatePresentation.description = "Replace the filter text with the selected file name"
+        }
+
+        override fun actionPerformed(event: AnActionEvent) {
+            val file = selectedDescriptorFile() ?: return
+            replaceFilterText(file.name)
+        }
+
+        override fun update(event: AnActionEvent) {
+            event.presentation.isEnabled = selectedDescriptorFile() != null
+        }
+
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+    }
+
+    private inner class AutoloadHierarchyAction : DumbAwareToggleAction("Autoload Hierarchy") {
+        override fun isSelected(event: AnActionEvent): Boolean = autoloadHierarchy
+
+        override fun setSelected(event: AnActionEvent, state: Boolean) {
+            if (autoloadHierarchy != state) {
+                autoloadHierarchy = state
+                properties.setValue(AUTOLOAD_HIERARCHY_PROPERTY, autoloadHierarchy, false)
+                restartAutoload()
             }
         }
     }
 
     override fun dispose() {
+        cancelAutoload()
         filterRefreshTimer.stop()
+        autoloadRefreshTimer.stop()
         super.dispose()
     }
 
     companion object {
-        const val INCLUDING_VIEW = "Including..."
-        const val INCLUDED_BY_VIEW = "IncludedBy..."
+        const val INCLUDEES_TREE_VIEW = "Includees..."
+        const val INCLUDEES_FLAT_VIEW = "IncludeesFlat..."
+        const val INCLUDERS_TREE_VIEW = "Includers..."
+        const val INCLUDERS_FLAT_VIEW = "IncludersFlat..."
         private const val FILTER_REFRESH_DELAY_MS = 200
         private const val PROPERTY_PREFIX = "includes.analysis.hierarchy."
-        private const val SHOW_INCLUDED_BY_PROPERTY = PROPERTY_PREFIX + "show.included.by"
+        private const val SHOW_INCLUDERS_PROPERTY = PROPERTY_PREFIX + "show.includers"
         private const val FLAT_MODE_PROPERTY = PROPERTY_PREFIX + "flat.mode"
         private const val SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY = PROPERTY_PREFIX + "show.out.of.scope.leaves"
-        private const val EXPAND_REPEATED_INCLUDES_PROPERTY = PROPERTY_PREFIX + "expand.repeated.includes"
+        private const val HIDE_REPEATED_INCLUDES_PROPERTY = PROPERTY_PREFIX + "hide.repeated.includes"
+        private const val FILTER_BY_FILE_PATH_PROPERTY = PROPERTY_PREFIX + "filter.by.file.path"
+        private const val SHOW_FULL_FILE_PATH_PROPERTY = PROPERTY_PREFIX + "show.full.file.path"
+        private const val AUTOLOAD_HIERARCHY_PROPERTY = PROPERTY_PREFIX + "autoload.hierarchy"
+        private const val AUTOLOAD_REFRESH_DELAY_MS = 500
     }
 }
