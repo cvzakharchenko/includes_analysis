@@ -158,13 +158,12 @@ class IncludeHierarchyBrowser(
     override fun createLegendPanel(): javax.swing.JPanel? = null
 
     override fun appendActions(actionGroup: DefaultActionGroup, helpID: String?) {
-        actionGroup.add(ScopeChooserAction())
-        actionGroup.add(Separator())
         actionGroup.add(DirectionToggleAction())
         actionGroup.add(FlatToggleAction())
         actionGroup.add(OptionsDropdownGroup())
         actionGroup.add(Separator())
         actionGroup.add(FilterFieldAction())
+        actionGroup.add(ScopeChooserAction())
         actionGroup.add(Separator())
         super.appendActions(actionGroup, helpID)
     }

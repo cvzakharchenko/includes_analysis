@@ -17,11 +17,12 @@ class IncludeNodeDescriptor(
     private val direction: IncludeDirection,
 ) : HierarchyNodeDescriptor(project, parentDescriptor, psiFile, isBase) {
 
-    // Memoize the cumulative descendant count for the life of this descriptor.
+    // Memoize the cumulative descendant counts for the life of this descriptor.
     // Descriptors are recreated by every refreshAllViews → IncludeTreeStructure rebuild,
-    // so the cached count tracks the latest state / cache snapshot. Autoload-driven
+    // so the cached counts track the latest state / cache snapshot. Autoload-driven
     // refreshes therefore pick up new descendants as the cache fills in.
-    private var cachedCount: Int = -1
+    private var cachedTotal: Int = -1
+    private var cachedFiltered: Int = -1
 
     override fun update(): Boolean {
         var changes = super.update()
@@ -32,7 +33,7 @@ class IncludeNodeDescriptor(
         } else {
             newText.ending.addText(file.name)
             if (state.showChildrenCount) {
-                newText.ending.addText(" (${descendantCount(file)})", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                newText.ending.addText(" (${descendantCountLabel(file)})", SimpleTextAttributes.GRAYED_ATTRIBUTES)
             }
             if (state.showFullPath) {
                 newText.ending.addText(" (${displayPath(file)})", SimpleTextAttributes.GRAYED_ATTRIBUTES)
@@ -46,16 +47,28 @@ class IncludeNodeDescriptor(
         return changes
     }
 
-    private fun descendantCount(file: PsiFile): Int {
-        if (cachedCount >= 0) return cachedCount
-        val computed = try {
-            cache.scopeBoundedReachable(file, direction, state).size
+    private fun descendantCountLabel(file: PsiFile): String {
+        computeCounts(file)
+        // No filter active → just the scope-bounded total. With a filter → "matched /
+        // total" so the user sees how many descendants the filter is keeping versus
+        // hiding. Descriptors are recreated on every refresh, so the memoized counts
+        // stay consistent with the current state snapshot.
+        return if (state.query.isEmpty()) cachedTotal.toString()
+        else "$cachedFiltered / $cachedTotal"
+    }
+
+    private fun computeCounts(file: PsiFile) {
+        if (cachedTotal >= 0) return
+        try {
+            val reachable = cache.scopeBoundedReachable(file, direction, state)
+            cachedTotal = reachable.size
+            cachedFiltered = if (state.query.isEmpty()) cachedTotal
+            else reachable.count { state.matchesQuery(it) }
         } catch (e: ProcessCanceledException) {
             throw e
         } catch (e: Throwable) {
-            0
+            cachedTotal = 0
+            cachedFiltered = 0
         }
-        cachedCount = computed
-        return computed
     }
 }
