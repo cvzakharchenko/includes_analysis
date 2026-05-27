@@ -1,0 +1,32 @@
+package com.github.cvzakharchenko.includesanalysis
+
+import com.intellij.openapi.components.PersistentStateComponent
+import com.intellij.openapi.components.Service
+import com.intellij.openapi.components.State
+import com.intellij.openapi.components.Storage
+import com.intellij.openapi.components.service
+import com.intellij.util.xmlb.XmlSerializerUtil
+
+@State(
+    name = "ProjectIncludeHierarchySettings",
+    storages = [Storage("projectIncludeHierarchy.xml")],
+)
+@Service(Service.Level.APP)
+class IncludeHierarchySettings : PersistentStateComponent<IncludeHierarchySettings> {
+    var direction: IncludeDirection = IncludeDirection.INCLUDEES
+    var flat: Boolean = false
+    var showFirstOutOfScopeLeaf: Boolean = false
+    var skipDuplicateSubtree: Boolean = false
+    var scopeName: String? = null
+
+    override fun getState(): IncludeHierarchySettings = this
+
+    override fun loadState(state: IncludeHierarchySettings) {
+        XmlSerializerUtil.copyBean(state, this)
+    }
+
+    companion object {
+        @JvmStatic
+        fun getInstance(): IncludeHierarchySettings = service()
+    }
+}

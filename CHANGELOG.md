@@ -1,7 +1,10 @@
 <!-- Keep a Changelog guide -> https://keepachangelog.com -->
 
-# includes_analysis Changelog
+# Project Include Hierarchy Changelog
 
 ## [Unreleased]
 ### Added
-- Initial scaffold created from [IntelliJ Platform Plugin Template](https://github.com/JetBrains/intellij-platform-plugin-template)
+- `Navigate → Project Include Hierarchy` action (default shortcut <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd>) opening a CLion Hierarchy tool window tab.
+- Scope dropdown reusing `ScopeChooserCombo` — supports built-in and custom IntelliJ scopes.
+- Flat List toggle that shows unique includes reachable through the current scope, sorted alphabetically.
+- Name filter field that keeps matching nodes along with their parents.

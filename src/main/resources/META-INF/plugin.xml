@@ -1,19 +1,28 @@
-<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
     <id>com.github.cvzakharchenko.includesanalysis</id>
-    <name>includes_analysis</name>
+    <name>Project Include Hierarchy</name>
     <vendor>cvzakharchenko</vendor>
     <description><![CDATA[
-        <p><b>includes_analysis</b> is a repository that provides a pure template to make it easier to create a new plugin project.</p>
-        <p>The main goal of this template is to speed up the setup phase of plugin development for both new and experienced developers by preconfiguring the project scaffold and CI, linking to the proper documentation pages, and keeping everything organized.</p>
+        <p>Adds a <b>Project Include Hierarchy</b> view for C/C++/Objective-C files in CLion.</p>
+        <ul>
+            <li><b>Scope dropdown</b> &mdash; reuse any IntelliJ scope (Project Files, custom scopes from Settings &rarr; Scopes, etc.) so "Expand All" doesn't drown in system headers.</li>
+            <li><b>Flat list toggle</b> &mdash; collapse the tree into a deduplicated alphabetical list of all unique includes reachable through the current scope.</li>
+            <li><b>Filter field</b> &mdash; type to keep only nodes whose name matches; parents of matches stay visible.</li>
+        </ul>
+        <p>Open via <b>Navigate &rarr; Project Include Hierarchy</b> or the editor context menu while a C/C++ file is open. The result is rendered in the standard Hierarchy tool window, so <i>Export to Text File</i>, <i>Refresh</i>, <i>Sort Alphabetically</i> and navigation all work as usual.</p>
     ]]></description>
 
-    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.clion</depends>
+    <depends>org.jetbrains.plugins.clion.radler</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
-
-    <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.github.cvzakharchenko.includesanalysis.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="com.github.cvzakharchenko.includesanalysis.startup.MyProjectActivity" />
-    </extensions>
+    <actions>
+        <action id="ProjectIncludeHierarchy.Browse"
+                class="com.github.cvzakharchenko.includesanalysis.BrowseIncludesAction"
+                text="Project Include Hierarchy"
+                description="Show the include hierarchy filtered by scope, with flat-list and name filter">
+            <add-to-group group-id="GoToMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt shift I"/>
+        </action>
+    </actions>
 </idea-plugin>
