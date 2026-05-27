@@ -51,6 +51,7 @@ class ScopedIncludeHierarchyBrowser(
 ) : HierarchyBrowserBaseEx(projectRef, file) {
     private val properties = PropertiesComponent.getInstance(projectRef)
     private var selectedScope: SearchScope = GlobalSearchScope.projectScope(projectRef)
+    private var selectedScopeName: String? = properties.getValue(SCOPE_NAME_PROPERTY)
     private val includeesCache = IncludeHierarchyCache(projectRef, includeGraph.getIncludees)
     private val includersCache = IncludeHierarchyCache(projectRef, includeGraph.getIncluders)
     private var flatMode = properties.getBoolean(FLAT_MODE_PROPERTY, false)
@@ -235,19 +236,28 @@ class ScopedIncludeHierarchyBrowser(
     }
 
     private fun createScopeChooser(): ScopeChooserCombo {
-        val chooser = ScopeChooserCombo()
-        chooser.init(projectRef, true, true, selectedScope, null)
+        val chooser = ScopeChooserCombo(projectRef, false, true, selectedScopeName ?: DEFAULT_SCOPE_NAME)
         shrinkScopeChooser(chooser)
-        chooser.addActionListener {
-            val scope = chooser.selectedScope ?: GlobalSearchScope.projectScope(projectRef)
-            if (scope != selectedScope) {
-                selectedScope = scope
-                rebuildWithoutClearingCaches(false)
-                restartAutoload()
-            }
+        updateSelectedScope(chooser, refresh = false)
+        chooser.childComponent.addActionListener {
+            updateSelectedScope(chooser, refresh = true)
         }
         Disposer.register(this, chooser)
         return chooser
+    }
+
+    private fun updateSelectedScope(chooser: ScopeChooserCombo, refresh: Boolean) {
+        val scope = chooser.selectedScope ?: GlobalSearchScope.projectScope(projectRef)
+        val scopeName = scope.displayName
+        val changed = scope != selectedScope || scopeName != selectedScopeName
+        selectedScope = scope
+        selectedScopeName = scopeName
+        properties.setValue(SCOPE_NAME_PROPERTY, scopeName)
+
+        if (refresh && changed) {
+            rebuildWithoutClearingCaches(false)
+            restartAutoload()
+        }
     }
 
     private fun shrinkScopeChooser(chooser: ScopeChooserCombo) {
@@ -669,6 +679,8 @@ class ScopedIncludeHierarchyBrowser(
         const val INCLUDERS_FLAT_VIEW = "IncludersFlat..."
         private const val FILTER_REFRESH_DELAY_MS = 200
         private const val PROPERTY_PREFIX = "includes.analysis.hierarchy."
+        private const val DEFAULT_SCOPE_NAME = "Project Files"
+        private const val SCOPE_NAME_PROPERTY = PROPERTY_PREFIX + "scope.name"
         private const val SHOW_INCLUDERS_PROPERTY = PROPERTY_PREFIX + "show.includers"
         private const val FLAT_MODE_PROPERTY = PROPERTY_PREFIX + "flat.mode"
         private const val SHOW_OUT_OF_SCOPE_LEAVES_PROPERTY = PROPERTY_PREFIX + "show.out.of.scope.leaves"
